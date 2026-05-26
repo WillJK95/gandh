@@ -116,10 +116,44 @@ def categorize_hospitality(detail_str):
     return 'Other / Gift Item'
 
 
+EMAIL_RE = re.compile(r'^[^@\s]+@[^@\s]+\.[^@\s]+$')
+
+
+def is_email(s):
+    return isinstance(s, str) and bool(EMAIL_RE.match(s.strip()))
+
+
 def clean_person_name(name_val):
+    # Persistent person-name map keys are pre-cleaning raw entries.
     if pd.isna(name_val) or not isinstance(name_val, str):
         return name_val
-    return name_val.replace(' & ', ' and ').replace('-', ' ').title().strip()
+    s = name_val.strip()
+    if not s:
+        return name_val
+
+    if is_email(s):
+        return s.lower()
+
+    s = s.replace(' & ', ' and ').replace('-', ' ')
+    s = re.sub(r'(?<=\w)[.,;:]+(?=\s|/|$)', '', s)
+    s = re.sub(r'\s*/\s*', ' / ', s)
+    s = re.sub(r'\s+', ' ', s)
+    return s.title().strip()
+
+
+def to_comparable_token(s):
+    """Convert a name or email into a comparable token so 'Jane Smith',
+    'jane.smith@dept.gov.uk', and 'J.Smith' all collapse to the same form
+    for the self-approval equality check."""
+    if pd.isna(s) or not isinstance(s, str):
+        return ''
+    s = s.strip().lower()
+    if is_email(s):
+        local = s.split('@')[0]
+        local = re.sub(r'[._\-]+', ' ', local)
+        local = re.sub(r'\d+$', '', local)
+        return local.strip()
+    return re.sub(r'[^a-z\s]', ' ', s).strip()
 
 
 # =============================================================================
@@ -314,6 +348,7 @@ def compute_org_normalisations(raw_orgs, persistent_org_map):
             auto_log.append({'Raw': raw, 'Canonical': canon, 'Score': 100, 'Reason': 'exact after light_normalise'})
 
     # Pool-level pairwise fuzzy: compare distinct canonicals to each other within block
+    persistent_dest_nrms = {light_normalise(dst) for dst in set(persistent_org_map.values())}
     if process is not None and len(canonical_pool) > 1:
         pool_by_block = {}
         for nrm, canon in canonical_pool.items():
@@ -350,6 +385,9 @@ def compute_org_normalisations(raw_orgs, persistent_org_map):
                     score = fuzz.token_set_ratio(a, b)
                     len_ratio = _len_ratio(canon_a, canon_b)
                     if score < 75:
+                        continue
+                    if a in persistent_dest_nrms and b in persistent_dest_nrms:
+                        # Both sides are user-asserted distinct destinations; don't merge.
                         continue
                     # The "raws" merged into the b-group inherit any human-intervention flags
                     b_members = norm_groups.get(b, [])
@@ -441,7 +479,9 @@ def calculate_single_group_compliance(group):
         accepted_group = group[group['status'].str.lower() == 'accepted']
         self_approved_flags = ['self approved', 'self-approved', 'on my own authority']
 
-        is_name_match = accepted_group['recipient_name_clean'].str.lower() == accepted_group['approver_name_clean'].str.lower()
+        recip_token = accepted_group['recipient_name'].apply(to_comparable_token)
+        appr_token = accepted_group['approver_name'].apply(to_comparable_token)
+        is_name_match = (recip_token == appr_token) & (recip_token != '')
         is_flag_match = accepted_group['approver_name'].str.lower().isin(self_approved_flags)
         self_approved_df = accepted_group[is_name_match | is_flag_match]
 
@@ -561,6 +601,88 @@ def generate_compliance_metrics(df):
         report_dfs['Data_Quality_Log'] = log_df[[c for c in log_cols if c in log_df.columns]]
 
     return report_dfs
+
+
+def run_analysis_pipeline():
+    """Apply normalisations from session state, derive analytical columns, persist
+    new mappings, and produce the report dataframes. Reachable both from the
+    no-orphan Apply button and from the orphan-review Confirm button."""
+    df_processed = st.session_state.mapped_working_df.copy()
+    persistent = st.session_state.name_mappings
+
+    # Build final org_map: auto-applied + cluster acceptances + orphan overrides
+    org_map = dict(st.session_state.get('org_auto_map', {}))
+    new_persistent_orgs = {}
+    cluster_count = st.session_state.get('cluster_count', 0)
+    for i in range(cluster_count):
+        canonical = st.session_state.get(f"cluster_canon_{i}", '').strip()
+        resolved = st.session_state.get(f"cluster_resolved_{i}")
+        if resolved is None or not canonical:
+            continue
+        for _, row in resolved.iterrows():
+            if not row.get('Include', True):
+                continue
+            raw = row['Raw']
+            org_map[raw] = canonical
+            new_persistent_orgs[raw] = canonical
+
+    # Orphan overrides: only persist if mapped onto an existing canonical (not
+    # singleton, not freshly-coined). Existing canonicals = anything already in
+    # org_map.values() OR in the persistent organisations map.
+    existing_canonicals = set(org_map.values()) | set(persistent.get('organizations', {}).values())
+    for raw, target in st.session_state.get('orphan_overrides', {}).items():
+        if not target or target == raw:
+            continue
+        org_map[raw] = target
+        if target in existing_canonicals:
+            new_persistent_orgs[raw] = target
+
+    # Person maps from edited table
+    recipient_map = {}
+    approver_map = {}
+    person_edited = st.session_state.get('person_review_df_edited', pd.DataFrame())
+    if not person_edited.empty:
+        for _, row in person_edited.iterrows():
+            if row['Type'] == 'Recipient Name':
+                recipient_map[row['Raw Entry']] = row['Normalized Entry']
+            elif row['Type'] == 'Approver Name':
+                approver_map[row['Raw Entry']] = row['Normalized Entry']
+
+    if 'recipient_name' in df_processed.columns:
+        df_processed['recipient_name_clean'] = df_processed['recipient_name'].map(recipient_map).fillna(
+            df_processed['recipient_name'].apply(clean_person_name))
+    if 'approver_name' in df_processed.columns:
+        df_processed['approver_name_clean'] = df_processed['approver_name'].map(approver_map).fillna(
+            df_processed['approver_name'].apply(clean_person_name))
+    if 'offered_by_org' in df_processed.columns:
+        df_processed['offered_by_org_clean'] = df_processed['offered_by_org'].map(org_map).fillna(
+            df_processed['offered_by_org'])
+
+    df_processed['timestamp'] = pd.to_datetime(df_processed['timestamp'], dayfirst=True, errors='coerce')
+    df_processed['date_received'] = pd.to_datetime(df_processed['date_received'], dayfirst=True, errors='coerce')
+    df_processed['year_declared'] = df_processed['timestamp'].dt.year
+    df_processed['month_declared'] = df_processed['timestamp'].dt.month
+    df_processed['quarter_declared'] = df_processed['timestamp'].dt.quarter
+    df_processed['declaration_lag_days'] = (df_processed['timestamp'] - df_processed['date_received']).dt.days
+
+    df_processed['hospitality_category'] = df_processed['details'].apply(categorize_hospitality)
+    df_processed['directorate_clean'] = df_processed['directorate'].astype(str).str.replace(' & ', ' and ', regex=False).str.strip()
+
+    if new_persistent_orgs:
+        persistent['organizations'].update(new_persistent_orgs)
+        save_name_mappings(persistent)
+        st.session_state.name_mappings = persistent
+
+    new_recips = {k: v for k, v in recipient_map.items() if str(k).strip() != str(v).strip() and v}
+    new_approvers = {k: v for k, v in approver_map.items() if str(k).strip() != str(v).strip() and v}
+    if new_recips or new_approvers:
+        persistent['recipients'].update(new_recips)
+        persistent['approvers'].update(new_approvers)
+        save_name_mappings(persistent)
+
+    st.session_state.final_reports = generate_compliance_metrics(df_processed)
+    st.session_state.df_processed = df_processed
+    st.session_state.stage = "analysis"
 
 
 # =============================================================================
@@ -832,6 +954,11 @@ if st.session_state.stage in ["normalization", "analysis"] and st.session_state.
                 st.session_state[f"cluster_resolved_{i}"] = edited
         st.session_state.cluster_count = len(sorted_clusters)
         st.session_state.cluster_proposed = [p for p, _ in sorted_clusters]
+        # Per-canonical (member_count, total_value) — used by the orphan-review stage
+        st.session_state.cluster_metrics_map = {
+            proposed: (len(members), cluster_metrics(members)[0])
+            for proposed, members in sorted_clusters
+        }
 
     # Recipient / Approver row-by-row review
     person_df = st.session_state.get('person_review_df', pd.DataFrame())
@@ -883,75 +1010,120 @@ if st.session_state.stage in ["normalization", "analysis"] and st.session_state.
                         st.success(f"Saved {len(new_map)} {label.lower()} mapping(s) to {MAPPING_FILE.name}")
 
     if st.button("Apply Normalisations & Run Pipeline", type="primary"):
-        df_processed = st.session_state.mapped_working_df.copy()
-
-        # Build final org_map from auto-applied + cluster review decisions
-        org_map = dict(st.session_state.get('org_auto_map', {}))
-        new_persistent_orgs = {}
+        # Collect orphans before applying. An "orphan" is a cluster member the
+        # user explicitly unticked — it floats with no proposed canonical.
+        orphans = []
         cluster_count = st.session_state.get('cluster_count', 0)
+        cluster_proposed = st.session_state.get('cluster_proposed', [])
         for i in range(cluster_count):
-            canonical = st.session_state.get(f"cluster_canon_{i}", '').strip()
+            proposed = cluster_proposed[i] if i < len(cluster_proposed) else ''
             resolved = st.session_state.get(f"cluster_resolved_{i}")
-            if resolved is None or not canonical:
+            if resolved is None:
                 continue
             for _, row in resolved.iterrows():
-                raw = row['Raw']
                 if not row.get('Include', True):
-                    # Split out — leave raw as-is (identity)
-                    continue
-                org_map[raw] = canonical
-                new_persistent_orgs[raw] = canonical
+                    orphans.append({
+                        'Raw': row['Raw'],
+                        'Original': proposed,
+                        'Score_To_Original': row.get('Score', 0),
+                        'Value': row.get('£ total', 0) or 0,
+                        'Rows': row.get('Rows', 0) or 0,
+                    })
 
-        # Person maps from edited table
-        recipient_map = {}
-        approver_map = {}
-        person_edited = st.session_state.get('person_review_df_edited', pd.DataFrame())
-        if not person_edited.empty:
-            for _, row in person_edited.iterrows():
-                if row['Type'] == 'Recipient Name':
-                    recipient_map[row['Raw Entry']] = row['Normalized Entry']
-                elif row['Type'] == 'Approver Name':
-                    approver_map[row['Raw Entry']] = row['Normalized Entry']
+        if orphans:
+            st.session_state.orphans = orphans
+            st.session_state.stage = "orphan_review"
+        else:
+            run_analysis_pipeline()
 
-        # Apply maps with fallbacks
-        if 'recipient_name' in df_processed.columns:
-            df_processed['recipient_name_clean'] = df_processed['recipient_name'].map(recipient_map).fillna(
-                df_processed['recipient_name'].apply(clean_person_name))
-        if 'approver_name' in df_processed.columns:
-            df_processed['approver_name_clean'] = df_processed['approver_name'].map(approver_map).fillna(
-                df_processed['approver_name'].apply(clean_person_name))
-        if 'offered_by_org' in df_processed.columns:
-            df_processed['offered_by_org_clean'] = df_processed['offered_by_org'].map(org_map).fillna(
-                df_processed['offered_by_org'])
 
-        # Time / category derivations
-        df_processed['timestamp'] = pd.to_datetime(df_processed['timestamp'], dayfirst=True, errors='coerce')
-        df_processed['date_received'] = pd.to_datetime(df_processed['date_received'], dayfirst=True, errors='coerce')
-        df_processed['year_declared'] = df_processed['timestamp'].dt.year
-        df_processed['month_declared'] = df_processed['timestamp'].dt.month
-        df_processed['quarter_declared'] = df_processed['timestamp'].dt.quarter
-        df_processed['declaration_lag_days'] = (df_processed['timestamp'] - df_processed['date_received']).dt.days
+# --- STEP 2b: ORPHAN REASSIGNMENT ---
+if st.session_state.stage == "orphan_review" and st.session_state.get('orphans'):
+    st.divider()
+    st.header("2b. Reassign orphaned offerer names")
+    st.caption("These were unticked from their proposed clusters. "
+               "Pick a destination, leave as a singleton, or create a new canonical. "
+               "Re-clustering by fuzzy match alone would just put them back where you took them out from — "
+               "so the choice here is human-led.")
 
-        df_processed['hospitality_category'] = df_processed['details'].apply(categorize_hospitality)
-        df_processed['directorate_clean'] = df_processed['directorate'].astype(str).str.replace(' & ', ' and ', regex=False).str.strip()
+    persistent = st.session_state.name_mappings
+    metrics_map = st.session_state.get('cluster_metrics_map', {})
+    auto_map = st.session_state.get('org_auto_map', {})
 
-        # Persist newly accepted cluster decisions
-        if new_persistent_orgs:
-            persistent['organizations'].update(new_persistent_orgs)
-            save_name_mappings(persistent)
-            st.session_state.name_mappings = persistent
+    # Build the surviving canonical pool with cluster-size + £ metadata.
+    canonical_metadata = {}
+    for canon in set(auto_map.values()):
+        canonical_metadata.setdefault(canon, (0, 0.0))
+    for i in range(st.session_state.get('cluster_count', 0)):
+        canon = st.session_state.get(f"cluster_canon_{i}", '').strip()
+        resolved = st.session_state.get(f"cluster_resolved_{i}")
+        if not canon or resolved is None:
+            continue
+        if not resolved['Include'].any():
+            continue
+        proposed = st.session_state.cluster_proposed[i]
+        size, value = metrics_map.get(proposed, (0, 0.0))
+        canonical_metadata[canon] = (size, value)
+    for dst in persistent.get('organizations', {}).values():
+        canonical_metadata.setdefault(dst, (0, 0.0))
 
-        # Persist person-name overrides too (where user diverged from clean_person_name default)
-        new_recips = {k: v for k, v in recipient_map.items() if str(k).strip() != str(v).strip() and v}
-        new_approvers = {k: v for k, v in approver_map.items() if str(k).strip() != str(v).strip() and v}
-        if new_recips or new_approvers:
-            persistent['recipients'].update(new_recips)
-            persistent['approvers'].update(new_approvers)
-            save_name_mappings(persistent)
+    include_original = st.checkbox(
+        "Allow the original cluster as a suggestion for these orphans",
+        value=False,
+        help="Hidden by default so you don't accidentally re-add a raw to the cluster you just unticked from.",
+    )
 
-        st.session_state.final_reports = generate_compliance_metrics(df_processed)
-        st.session_state.df_processed = df_processed
-        st.session_state.stage = "analysis"
+    orphans_sorted = sorted(st.session_state.orphans, key=lambda o: -(o['Value'] or 0))
+
+    for i, o in enumerate(orphans_sorted):
+        raw = o['Raw']
+        original = o['Original']
+        nrm_raw = light_normalise(raw)
+
+        scored = []
+        for canon, (size, value) in canonical_metadata.items():
+            if canon == original and not include_original:
+                continue
+            if fuzz is not None:
+                score = fuzz.token_set_ratio(nrm_raw, light_normalise(canon))
+            else:
+                score = 0
+            scored.append((canon, size, value, score))
+        scored.sort(key=lambda x: -x[3])
+
+        def _fmt(canon, size, value, score):
+            return f"{canon}   [{size} variants, £{value:,.0f}]   ·   match {score}"
+
+        options = (
+            ["(Keep as singleton)"]
+            + [_fmt(c, n, v, s) for c, n, v, s in scored[:50]]
+            + ["(Create new canonical →)"]
+        )
+
+        st.markdown(
+            f"**`{raw}`** — was in *{original}*, "
+            f"£{o['Value']:,.0f}, {o['Rows']} rows"
+        )
+        choice = st.selectbox(
+            "Reassign to:",
+            options,
+            key=f"orphan_choice_{i}",
+            label_visibility="collapsed",
+        )
+        if choice == "(Create new canonical →)":
+            new_name = st.text_input("New canonical name:", key=f"orphan_new_{i}")
+            st.session_state[f"orphan_resolved_{i}"] = new_name.strip() or raw
+        elif choice == "(Keep as singleton)":
+            st.session_state[f"orphan_resolved_{i}"] = raw
+        else:
+            st.session_state[f"orphan_resolved_{i}"] = choice.split("   ·   ")[0].split("   [")[0].strip()
+
+    if st.button("Confirm Reassignments & Run Pipeline", type="primary"):
+        st.session_state.orphan_overrides = {
+            o['Raw']: st.session_state.get(f"orphan_resolved_{i}", o['Raw'])
+            for i, o in enumerate(orphans_sorted)
+        }
+        run_analysis_pipeline()
 
 # --- STEP 4: REPORTS & EXPORTS ---
 if st.session_state.stage == "analysis" and "final_reports" in st.session_state:
