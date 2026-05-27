@@ -46,14 +46,24 @@ def load_name_mappings():
         try:
             with open(MAPPING_FILE, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-            for key in ('organizations', 'recipients', 'approvers'):
+            for key in ('organizations', 'recipients', 'approvers', 'staff'):
                 data.setdefault(key, {})
             return data
         except (json.JSONDecodeError, OSError):
             pass
-    data = {'organizations': dict(SEED_ORG_MAP), 'recipients': {}, 'approvers': {}}
+    data = {'organizations': dict(SEED_ORG_MAP), 'recipients': {}, 'approvers': {}, 'staff': {}}
     save_name_mappings(data)
     return data
+
+
+def get_staff_map(persistent):
+    """Unified staff manual map: legacy recipients + approvers read-only, new
+    entries land in 'staff' which wins on conflict."""
+    merged = {}
+    merged.update(persistent.get('recipients', {}))
+    merged.update(persistent.get('approvers', {}))
+    merged.update(persistent.get('staff', {}))
+    return merged
 
 
 def save_name_mappings(data):
@@ -117,10 +127,27 @@ def categorize_hospitality(detail_str):
 
 
 EMAIL_RE = re.compile(r'^[^@\s]+@[^@\s]+\.[^@\s]+$')
+PAREN_RE = re.compile(r'\(([^)]*)\)')
+
+GENERIC_MAILBOX_TOKENS = {'info', 'enquiries', 'noreply', 'no reply', 'admin', 'contact', 'hello', 'support', 'office'}
 
 
 def is_email(s):
     return isinstance(s, str) and bool(EMAIL_RE.match(s.strip()))
+
+
+def email_to_person_name(s):
+    """Turn 'jane.smith@dept.gov.uk' into 'Jane Smith'. Returns the lowercased
+    email unchanged when the local part is empty or a generic mailbox token."""
+    if not is_email(s):
+        return None
+    email = s.strip().lower()
+    local = email.split('@')[0]
+    local = re.sub(r'[._\-]+', ' ', local)
+    local = re.sub(r'\d+$', '', local).strip()
+    if not local or local in GENERIC_MAILBOX_TOKENS:
+        return email
+    return local.title()
 
 
 def clean_person_name(name_val):
@@ -132,8 +159,9 @@ def clean_person_name(name_val):
         return name_val
 
     if is_email(s):
-        return s.lower()
+        return email_to_person_name(s)
 
+    s = PAREN_RE.sub(' ', s)
     s = s.replace(' & ', ' and ').replace('-', ' ')
     s = re.sub(r'(?<=\w)[.,;:]+(?=\s|/|$)', '', s)
     s = re.sub(r'\s*/\s*', ' / ', s)
@@ -172,7 +200,6 @@ INTERMEDIARY_PATTERNS = [
     re.compile(r'^(.*?)\s+(?:courtesy of|on behalf of|via|guest of|hosted by)\s+(.+)$', re.IGNORECASE),
 ]
 
-PAREN_RE = re.compile(r'\(([^)]*)\)')
 HUMAN_INTERVENTION_RE = re.compile(r'courtesy of|on behalf of|\bvia\b|guest of|\bhosted by\b|&|\band\b|,', re.IGNORECASE)
 
 
@@ -439,18 +466,220 @@ def compute_org_normalisations(raw_orgs, persistent_org_map):
     return auto_map, auto_log, review_records
 
 
-def compute_person_normalisations(values, persistent_map, label):
-    records = []
-    for raw in values:
-        if not isinstance(raw, str) or not raw.strip():
+PERSON_STOP_WORDS = {'mr', 'mrs', 'ms', 'miss', 'dr', 'prof', 'sir', 'dame'}
+
+
+def light_normalise_person(s):
+    if not isinstance(s, str):
+        return ''
+    out = s.lower()
+    out = re.sub(r'[^\w\s]', ' ', out)
+    tokens = [t for t in out.split() if t and t not in PERSON_STOP_WORDS]
+    return ' '.join(tokens)
+
+
+def extract_person_candidate(raw):
+    """('Tom Smith (Director of CSY)', '') -> ('Tom Smith', 'Director of CSY').
+    Emails are routed through the email-to-name converter, so
+    'jane.smith@dept.gov.uk' becomes ('Jane Smith', '')."""
+    if not isinstance(raw, str) or not raw.strip():
+        return ('', '')
+    s = raw.strip()
+    if is_email(s):
+        return (email_to_person_name(s), '')
+    note_match = PAREN_RE.search(s)
+    note = note_match.group(1).strip() if note_match else ''
+    s_no_paren = re.sub(r'\s+', ' ', PAREN_RE.sub(' ', s)).strip()
+    return (s_no_paren, note)
+
+
+def compute_staff_normalisations(raw_names, persistent_staff_map):
+    """Tiered staff-name normalisation. Same shape as compute_org_normalisations
+    but tuned for person names: no 'courtesy of' semantics, parenthetical role
+    text stripped, emails converted to 'First Last'.
+
+    Returns:
+        auto_map: dict raw -> canonical
+        auto_log: list of {Raw, Canonical, Score, Reason}
+        review_records: list of {Raw, Proposed_Canonical, Score, Length_Ratio, Flags, Parenthetical}
+    """
+    raw_names = [n for n in raw_names if isinstance(n, str) and n.strip()]
+    unique_raw = sorted(set(raw_names))
+
+    auto_map = {}
+    auto_log = []
+    review_records = []
+    review_seen = set()
+
+    def add_review(raw, canon, score, len_ratio, flags, parenthetical):
+        if raw in review_seen:
+            return
+        review_seen.add(raw)
+        review_records.append({
+            'Raw': raw,
+            'Proposed_Canonical': canon,
+            'Score': score,
+            'Length_Ratio': round(len_ratio, 2),
+            'Flags': ', '.join(flags) if isinstance(flags, (list, tuple, set)) else flags,
+            'Parenthetical': parenthetical,
+        })
+
+    candidates = {}
+    for raw in unique_raw:
+        cand, note = extract_person_candidate(raw)
+        candidates[raw] = {
+            'candidate': cand,
+            'parenthetical': note,
+            'normalised': light_normalise_person(cand),
+            'has_human_intervention': False,
+        }
+
+    norm_to_persistent = {light_normalise_person(src): dst for src, dst in persistent_staff_map.items()}
+
+    pending = []
+    for raw in unique_raw:
+        c = candidates[raw]
+        if raw in persistent_staff_map:
+            auto_map[raw] = persistent_staff_map[raw]
+            auto_log.append({'Raw': raw, 'Canonical': persistent_staff_map[raw], 'Score': 100, 'Reason': 'manual_map'})
             continue
-        if raw in persistent_map:
-            proposed = persistent_map[raw]
-        else:
-            proposed = clean_person_name(raw)
-        if raw.strip() != str(proposed).strip():
-            records.append({'Type': label, 'Raw Entry': raw, 'Normalized Entry': proposed})
-    return records
+        if c['candidate'] and c['candidate'] in persistent_staff_map:
+            auto_map[raw] = persistent_staff_map[c['candidate']]
+            auto_log.append({'Raw': raw, 'Canonical': persistent_staff_map[c['candidate']], 'Score': 100, 'Reason': 'manual_map (after extract)'})
+            continue
+        if c['normalised'] and c['normalised'] in norm_to_persistent:
+            auto_map[raw] = norm_to_persistent[c['normalised']]
+            auto_log.append({'Raw': raw, 'Canonical': norm_to_persistent[c['normalised']], 'Score': 100, 'Reason': 'manual_map (normalised)'})
+            continue
+        pending.append(raw)
+
+    norm_groups = {}
+    for raw in pending:
+        nrm = candidates[raw]['normalised']
+        if not nrm:
+            continue
+        norm_groups.setdefault(nrm, []).append(raw)
+
+    group_canon = {}
+    for nrm, members in norm_groups.items():
+        members_sorted = sorted(members, key=lambda r: -len(candidates[r]['candidate']))
+        group_canon[nrm] = candidates[members_sorted[0]]['candidate']
+
+    canonical_pool = {}
+    for dst in set(persistent_staff_map.values()):
+        canonical_pool[light_normalise_person(dst)] = dst
+    for nrm, canon in group_canon.items():
+        canonical_pool.setdefault(nrm, canon)
+
+    # Auto-merge exact-normalised duplicates within group
+    for nrm, members in norm_groups.items():
+        canon = canonical_pool[nrm]
+        for raw in members:
+            if raw == canon:
+                continue
+            auto_map[raw] = canon
+            auto_log.append({'Raw': raw, 'Canonical': canon, 'Score': 100, 'Reason': 'exact after light_normalise'})
+
+    persistent_dest_nrms = {light_normalise_person(dst) for dst in set(persistent_staff_map.values())}
+    if process is not None and len(canonical_pool) > 1:
+        pool_by_block = {}
+        for nrm, canon in canonical_pool.items():
+            pool_by_block.setdefault(first_token_block_key(canon), []).append(nrm)
+
+        parent = {nrm: nrm for nrm in canonical_pool}
+
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a, b):
+            ra, rb = find(a), find(b)
+            if ra == rb:
+                return
+            if len(canonical_pool[ra]) >= len(canonical_pool[rb]):
+                parent[rb] = ra
+            else:
+                parent[ra] = rb
+
+        for block, nrms in pool_by_block.items():
+            if len(nrms) < 2:
+                continue
+            nrms_sorted = sorted(nrms, key=lambda n: -len(canonical_pool[n]))
+            for i, a in enumerate(nrms_sorted):
+                for b in nrms_sorted[i + 1:]:
+                    canon_a, canon_b = canonical_pool[a], canonical_pool[b]
+                    score = fuzz.token_set_ratio(a, b)
+                    len_ratio = _len_ratio(canon_a, canon_b)
+                    if score < 75:
+                        continue
+                    if a in persistent_dest_nrms and b in persistent_dest_nrms:
+                        continue
+                    is_substring = (a in b or b in a)
+                    b_members = norm_groups.get(b, [])
+                    a_single = len(a.split()) <= 1
+                    b_single = len(b.split()) <= 1
+                    single_token = a_single or b_single
+
+                    if not single_token and score >= 92 and 0.7 <= len_ratio <= 1.3:
+                        union(a, b)
+                        for raw in b_members:
+                            if raw in auto_map:
+                                continue
+                            auto_map[raw] = canon_a
+                            auto_log.append({'Raw': raw, 'Canonical': canon_a, 'Score': score, 'Reason': 'pool-merge balanced'})
+                        if canon_b in unique_raw and canon_b != canon_a and canon_b not in auto_map:
+                            auto_map[canon_b] = canon_a
+                            auto_log.append({'Raw': canon_b, 'Canonical': canon_a, 'Score': score, 'Reason': 'pool-merge balanced'})
+                        continue
+                    if not single_token and score >= 88 and is_substring and len_ratio >= 0.7:
+                        union(a, b)
+                        for raw in b_members:
+                            if raw in auto_map:
+                                continue
+                            auto_map[raw] = canon_a
+                            auto_log.append({'Raw': raw, 'Canonical': canon_a, 'Score': score, 'Reason': 'pool-merge substring'})
+                        if canon_b in unique_raw and canon_b != canon_a and canon_b not in auto_map:
+                            auto_map[canon_b] = canon_a
+                            auto_log.append({'Raw': canon_b, 'Canonical': canon_a, 'Score': score, 'Reason': 'pool-merge substring'})
+                        continue
+
+                    cluster_size = len(b_members) or 1
+                    rep_info = {
+                        'candidate': canon_b,
+                        'normalised': b,
+                        'has_human_intervention': False,
+                        'parenthetical': '',
+                    }
+                    if single_token:
+                        flags = ['single_token']
+                        if 75 <= score <= 91:
+                            flags.append('mid_confidence')
+                        for raw in b_members:
+                            add_review(raw, canon_a, score, len_ratio, flags, candidates[raw]['parenthetical'])
+                        if canon_b in unique_raw and canon_b not in review_seen and canon_b not in auto_map:
+                            add_review(canon_b, canon_a, score, len_ratio, flags, '')
+                        continue
+
+                    tier, info = _classify_tier(score, len_ratio, rep_info, canon_a, cluster_size)
+                    if tier == 'review':
+                        for raw in b_members:
+                            add_review(raw, canon_a, score, len_ratio, info, candidates[raw]['parenthetical'])
+                        if canon_b in unique_raw and canon_b not in review_seen and canon_b not in auto_map:
+                            add_review(canon_b, canon_a, score, len_ratio, info, '')
+
+    # Singleton-only review: pull in any solo single-token entries that didn't
+    # match anything else, so the user can still review/merge them by hand.
+    for raw in pending:
+        if raw in auto_map or raw in review_seen:
+            continue
+        cand = candidates[raw]['candidate']
+        nrm = candidates[raw]['normalised']
+        if nrm and len(nrm.split()) <= 1:
+            add_review(raw, cand, 100, 1.0, ['single_token'], candidates[raw]['parenthetical'])
+
+    return auto_map, auto_log, review_records
 
 
 # =============================================================================
@@ -637,22 +866,27 @@ def run_analysis_pipeline():
         if target in existing_canonicals:
             new_persistent_orgs[raw] = target
 
-    # Person maps from edited table
-    recipient_map = {}
-    approver_map = {}
-    person_edited = st.session_state.get('person_review_df_edited', pd.DataFrame())
-    if not person_edited.empty:
-        for _, row in person_edited.iterrows():
-            if row['Type'] == 'Recipient Name':
-                recipient_map[row['Raw Entry']] = row['Normalized Entry']
-            elif row['Type'] == 'Approver Name':
-                approver_map[row['Raw Entry']] = row['Normalized Entry']
+    # Shared staff map: auto-applied + cluster acceptances
+    staff_map = dict(st.session_state.get('staff_auto_map', {}))
+    new_persistent_staff = {}
+    staff_cluster_count = st.session_state.get('staff_cluster_count', 0)
+    for i in range(staff_cluster_count):
+        canonical = st.session_state.get(f"staff_cluster_canon_{i}", '').strip()
+        resolved = st.session_state.get(f"staff_cluster_resolved_{i}")
+        if resolved is None or not canonical:
+            continue
+        for _, row in resolved.iterrows():
+            if not row.get('Include', True):
+                continue
+            raw = row['Raw']
+            staff_map[raw] = canonical
+            new_persistent_staff[raw] = canonical
 
     if 'recipient_name' in df_processed.columns:
-        df_processed['recipient_name_clean'] = df_processed['recipient_name'].map(recipient_map).fillna(
+        df_processed['recipient_name_clean'] = df_processed['recipient_name'].map(staff_map).fillna(
             df_processed['recipient_name'].apply(clean_person_name))
     if 'approver_name' in df_processed.columns:
-        df_processed['approver_name_clean'] = df_processed['approver_name'].map(approver_map).fillna(
+        df_processed['approver_name_clean'] = df_processed['approver_name'].map(staff_map).fillna(
             df_processed['approver_name'].apply(clean_person_name))
     if 'offered_by_org' in df_processed.columns:
         df_processed['offered_by_org_clean'] = df_processed['offered_by_org'].map(org_map).fillna(
@@ -673,12 +907,11 @@ def run_analysis_pipeline():
         save_name_mappings(persistent)
         st.session_state.name_mappings = persistent
 
-    new_recips = {k: v for k, v in recipient_map.items() if str(k).strip() != str(v).strip() and v}
-    new_approvers = {k: v for k, v in approver_map.items() if str(k).strip() != str(v).strip() and v}
-    if new_recips or new_approvers:
-        persistent['recipients'].update(new_recips)
-        persistent['approvers'].update(new_approvers)
+    new_staff = {k: v for k, v in new_persistent_staff.items() if str(k).strip() != str(v).strip() and v}
+    if new_staff:
+        persistent['staff'].update(new_staff)
         save_name_mappings(persistent)
+        st.session_state.name_mappings = persistent
 
     st.session_state.final_reports = generate_compliance_metrics(df_processed)
     st.session_state.df_processed = df_processed
@@ -845,22 +1078,35 @@ if st.session_state.stage in ["mapping", "normalization", "analysis"] and st.ses
             st.session_state.org_dir_lookup = dir_lookup
             st.session_state.org_count_lookup = count_lookup
 
-            # Recipient + Approver row-by-row suggestions
-            recip_recs = []
-            if 'recipient_name' in mapped_df.columns:
-                recip_recs = compute_person_normalisations(
-                    mapped_df['recipient_name'].dropna().unique(),
-                    persistent.get('recipients', {}),
-                    'Recipient Name',
-                )
-            approver_recs = []
-            if 'approver_name' in mapped_df.columns:
-                approver_recs = compute_person_normalisations(
-                    mapped_df['approver_name'].dropna().unique(),
-                    persistent.get('approvers', {}),
-                    'Approver Name',
-                )
-            st.session_state.person_review_df = pd.DataFrame(recip_recs + approver_recs)
+            # Shared staff (recipient + approver) pool normalisation
+            recip_uniques = set(mapped_df['recipient_name'].dropna().unique()) if 'recipient_name' in mapped_df.columns else set()
+            approver_uniques = set(mapped_df['approver_name'].dropna().unique()) if 'approver_name' in mapped_df.columns else set()
+            raw_staff = sorted(recip_uniques | approver_uniques)
+            staff_auto_map, staff_auto_log, staff_review_records = compute_staff_normalisations(
+                raw_staff, get_staff_map(persistent)
+            )
+
+            # Risk-weighted metadata: sum value/count/dir-spread across BOTH roles
+            staff_value_lookup = {}
+            staff_count_lookup = {}
+            staff_dir_lookup = {}
+            for raw in raw_staff:
+                row_mask = pd.Series(False, index=mapped_df.index)
+                if 'recipient_name' in mapped_df.columns:
+                    row_mask = row_mask | (mapped_df['recipient_name'] == raw)
+                if 'approver_name' in mapped_df.columns:
+                    row_mask = row_mask | (mapped_df['approver_name'] == raw)
+                subset = mapped_df[row_mask]
+                staff_count_lookup[raw] = int(row_mask.sum())
+                staff_value_lookup[raw] = float(subset['value_parsed_gbp'].sum()) if 'value_parsed_gbp' in subset.columns else 0.0
+                staff_dir_lookup[raw] = int(subset['directorate'].nunique()) if 'directorate' in subset.columns else 0
+
+            st.session_state.staff_auto_map = staff_auto_map
+            st.session_state.staff_auto_log = pd.DataFrame(staff_auto_log)
+            st.session_state.staff_review_records = staff_review_records
+            st.session_state.staff_value_lookup = staff_value_lookup
+            st.session_state.staff_count_lookup = staff_count_lookup
+            st.session_state.staff_dir_lookup = staff_dir_lookup
 
             st.session_state.stage = "normalization"
 
@@ -960,33 +1206,95 @@ if st.session_state.stage in ["normalization", "analysis"] and st.session_state.
             for proposed, members in sorted_clusters
         }
 
-    # Recipient / Approver row-by-row review
-    person_df = st.session_state.get('person_review_df', pd.DataFrame())
-    if not person_df.empty:
-        st.subheader("Recipient / Approver name review")
-        st.caption("Edit the Normalized Entry cell to override. Leave as-is to accept the proposed value.")
-        edited_person = st.data_editor(
-            person_df,
-            column_config={
-                'Type': st.column_config.TextColumn(disabled=True),
-                'Raw Entry': st.column_config.TextColumn(disabled=True),
-                'Normalized Entry': st.column_config.TextColumn(disabled=False),
-            },
-            hide_index=True,
-            use_container_width=True,
-            key='person_editor',
-        )
-        st.session_state.person_review_df_edited = edited_person
+    # Staff (recipient + approver) cluster review
+    staff_auto_log_df = st.session_state.get('staff_auto_log', pd.DataFrame())
+    if not staff_auto_log_df.empty:
+        with st.expander(f"✅ Auto-applied staff merges ({len(staff_auto_log_df)} entries)", expanded=False):
+            st.caption("Silent merges: manual-map hits, exact-after-normalise duplicates, "
+                       "email-to-name conversions, and high-confidence fuzzy matches.")
+            st.dataframe(staff_auto_log_df, use_container_width=True)
+
+    st.subheader("Staff (recipient + approver) cluster review")
+    staff_review_records = st.session_state.get('staff_review_records', [])
+    staff_value_lookup = st.session_state.get('staff_value_lookup', {})
+    staff_count_lookup = st.session_state.get('staff_count_lookup', {})
+    staff_dir_lookup = st.session_state.get('staff_dir_lookup', {})
+
+    if not staff_review_records:
+        st.success("No staff name pairs require review.")
+        st.session_state.staff_cluster_count = 0
     else:
-        st.session_state.person_review_df_edited = pd.DataFrame()
+        staff_clusters = {}
+        for rec in staff_review_records:
+            staff_clusters.setdefault(rec['Proposed_Canonical'], []).append(rec)
+
+        def staff_cluster_metrics(members):
+            total_value = sum(staff_value_lookup.get(m['Raw'], 0) or 0 for m in members)
+            total_count = sum(staff_count_lookup.get(m['Raw'], 0) or 0 for m in members)
+            dir_spread = max((staff_dir_lookup.get(m['Raw'], 0) for m in members), default=0)
+            return total_value, total_count, dir_spread
+
+        sorted_staff_clusters = sorted(
+            staff_clusters.items(),
+            key=lambda kv: (staff_cluster_metrics(kv[1])[0], staff_cluster_metrics(kv[1])[1]),
+            reverse=True,
+        )
+
+        st.caption("One canonical per cluster — edits apply to both recipient and approver columns. "
+                   "Edit the canonical text or untick variants to leave them as singletons.")
+
+        for i, (proposed, members) in enumerate(sorted_staff_clusters):
+            total_value, total_count, dir_spread = staff_cluster_metrics(members)
+            flags = sorted({f for m in members for f in m['Flags'].split(', ') if f})
+            header = f"**{proposed}** — {len(members)} variant(s), {total_count} rows, £{total_value:,.0f}"
+            if flags:
+                header += f" · flags: {', '.join(flags)}"
+            with st.expander(header, expanded=False):
+                st.text_input(
+                    "Canonical name",
+                    value=proposed,
+                    key=f"staff_cluster_canon_{i}",
+                )
+                member_df = pd.DataFrame([{
+                    'Include': True,
+                    'Raw': m['Raw'],
+                    'Score': m['Score'],
+                    'Len ratio': m['Length_Ratio'],
+                    'Flags': m['Flags'],
+                    'Rows': staff_count_lookup.get(m['Raw'], 0),
+                    '£ total': staff_value_lookup.get(m['Raw'], 0) or 0,
+                    'Parenthetical': m['Parenthetical'],
+                } for m in members])
+                edited = st.data_editor(
+                    member_df,
+                    column_config={
+                        'Include': st.column_config.CheckboxColumn(help="Untick to leave this raw as its own value"),
+                        'Raw': st.column_config.TextColumn(disabled=True),
+                        'Score': st.column_config.NumberColumn(disabled=True),
+                        'Len ratio': st.column_config.NumberColumn(disabled=True),
+                        'Flags': st.column_config.TextColumn(disabled=True),
+                        'Rows': st.column_config.NumberColumn(disabled=True),
+                        '£ total': st.column_config.NumberColumn(format='£%.0f', disabled=True),
+                        'Parenthetical': st.column_config.TextColumn(disabled=True),
+                    },
+                    hide_index=True,
+                    use_container_width=True,
+                    key=f"staff_cluster_members_{i}",
+                )
+                st.session_state[f"staff_cluster_resolved_{i}"] = edited
+        st.session_state.staff_cluster_count = len(sorted_staff_clusters)
+        st.session_state.staff_cluster_proposed = [p for p, _ in sorted_staff_clusters]
 
     # Persistent dictionary management
     with st.expander("📚 Manual mappings (persistent across sessions)", expanded=False):
         st.caption(f"Stored at `{MAPPING_FILE}`. Edits here are written immediately on Save.")
-        tab_o, tab_r, tab_a = st.tabs(["Organizations", "Recipients", "Approvers"])
+        tab_o, tab_s = st.tabs(["Organizations", "Staff"])
+        if persistent.get('recipients') or persistent.get('approvers'):
+            with tab_s:
+                st.caption("Legacy Recipients/Approvers entries from earlier versions are still respected on read "
+                           "(see `name_mappings.json` directly). New entries below land in the unified 'staff' map.")
         for label, key, tab in [("Organizations", "organizations", tab_o),
-                                 ("Recipients", "recipients", tab_r),
-                                 ("Approvers", "approvers", tab_a)]:
+                                 ("Staff", "staff", tab_s)]:
             with tab:
                 current = persistent.get(key, {})
                 edit_df = pd.DataFrame(
