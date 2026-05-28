@@ -46,12 +46,22 @@ def load_name_mappings():
         try:
             with open(MAPPING_FILE, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-            for key in ('organizations', 'recipients', 'approvers', 'staff'):
+            for key in ('organizations', 'recipients', 'approvers', 'staff', 'directorates'):
                 data.setdefault(key, {})
+            data.setdefault('forced_clusters', {'organizations': [], 'staff': [], 'directorates': []})
+            for k in ('organizations', 'staff', 'directorates'):
+                data['forced_clusters'].setdefault(k, [])
             return data
         except (json.JSONDecodeError, OSError):
             pass
-    data = {'organizations': dict(SEED_ORG_MAP), 'recipients': {}, 'approvers': {}, 'staff': {}}
+    data = {
+        'organizations': dict(SEED_ORG_MAP),
+        'recipients': {},
+        'approvers': {},
+        'staff': {},
+        'directorates': {},
+        'forced_clusters': {'organizations': [], 'staff': [], 'directorates': []},
+    }
     save_name_mappings(data)
     return data
 
@@ -64,6 +74,31 @@ def get_staff_map(persistent):
     merged.update(persistent.get('approvers', {}))
     merged.update(persistent.get('staff', {}))
     return merged
+
+
+def apply_forced_clusters(base_map, forced_pairs):
+    """Augment a raw -> canonical map with forced cluster pairs. For each pair
+    (A, B) the cleaner of A and B wins as the canonical; both raws then point
+    to that canonical. Existing entries in base_map are preserved unless the
+    forced pair explicitly overrides them."""
+    out = dict(base_map or {})
+    for pair in forced_pairs or []:
+        if not isinstance(pair, (list, tuple)) or len(pair) < 2:
+            continue
+        a, b = str(pair[0]).strip(), str(pair[1]).strip()
+        if not a or not b:
+            continue
+        # Resolve through existing map first so chained forces still collapse.
+        canon_a = out.get(a, a)
+        canon_b = out.get(b, b)
+        winner = canon_a if canonical_preference_key(canon_a) <= canonical_preference_key(canon_b) else canon_b
+        out[a] = winner
+        out[b] = winner
+        if canon_a != winner:
+            out[canon_a] = winner
+        if canon_b != winner:
+            out[canon_b] = winner
+    return out
 
 
 def save_name_mappings(data):
@@ -150,6 +185,35 @@ def email_to_person_name(s):
     return local.title()
 
 
+# Joint-name separators: ' & ', ' and ', ' / ', '/'. Slash is the only one
+# allowed to appear without surrounding whitespace (it's an unambiguous
+# delimiter in this register). 'and' must be a standalone token.
+JOINT_SEP_RE = re.compile(r'\s+(?:&|and)\s+|\s*/\s*', re.IGNORECASE)
+
+
+def is_joint(name):
+    return isinstance(name, str) and bool(JOINT_SEP_RE.search(name))
+
+
+def split_joint(name):
+    if not isinstance(name, str):
+        return []
+    parts = [p.strip() for p in JOINT_SEP_RE.split(name)]
+    return [p for p in parts if p]
+
+
+def canonical_preference_key(name):
+    """Lower tuple wins. Prefer no parens > no extra punctuation > longer > alpha."""
+    if not isinstance(name, str):
+        return (True, True, 0, '')
+    return (
+        bool(PAREN_RE.search(name)),
+        bool(re.search(r'[.,;:]', name)),
+        -len(name),
+        name,
+    )
+
+
 def clean_person_name(name_val):
     # Persistent person-name map keys are pre-cleaning raw entries.
     if pd.isna(name_val) or not isinstance(name_val, str):
@@ -161,10 +225,19 @@ def clean_person_name(name_val):
     if is_email(s):
         return email_to_person_name(s)
 
+    if is_joint(s):
+        cleaned = []
+        for comp in split_joint(s):
+            c = clean_person_name(comp)
+            if isinstance(c, str) and c.strip():
+                cleaned.append(c.strip())
+        if cleaned:
+            return ' & '.join(sorted(cleaned, key=str.lower))
+        return s
+
     s = PAREN_RE.sub(' ', s)
-    s = s.replace(' & ', ' and ').replace('-', ' ')
+    s = s.replace('-', ' ')
     s = re.sub(r'(?<=\w)[.,;:]+(?=\s|/|$)', '', s)
-    s = re.sub(r'\s*/\s*', ' / ', s)
     s = re.sub(r'\s+', ' ', s)
     return s.title().strip()
 
@@ -346,12 +419,13 @@ def compute_org_normalisations(raw_orgs, persistent_org_map):
             continue
         norm_groups.setdefault(nrm, []).append(raw)
 
-    # Pick one representative canonical per group (prefer no-human-intervention, then longest)
+    # Pick one representative canonical per group (prefer no-human-intervention,
+    # then no parens, then no other punctuation, then longer)
     group_canon = {}
     for nrm, members in norm_groups.items():
         members_sorted = sorted(
             members,
-            key=lambda r: (candidates[r]['has_human_intervention'], -len(candidates[r]['candidate'])),
+            key=lambda r: (candidates[r]['has_human_intervention'], *canonical_preference_key(candidates[r]['candidate'])),
         )
         group_canon[nrm] = candidates[members_sorted[0]]['candidate']
 
@@ -394,8 +468,8 @@ def compute_org_normalisations(raw_orgs, persistent_org_map):
             ra, rb = find(a), find(b)
             if ra == rb:
                 return
-            # The longer canonical wins as the cluster root
-            if len(canonical_pool[ra]) >= len(canonical_pool[rb]):
+            # The 'cleaner' canonical wins as the cluster root (no parens > no extra punct > longer)
+            if canonical_preference_key(canonical_pool[ra]) <= canonical_preference_key(canonical_pool[rb]):
                 parent[rb] = ra
             else:
                 parent[ra] = rb
@@ -404,8 +478,8 @@ def compute_org_normalisations(raw_orgs, persistent_org_map):
         for block, nrms in pool_by_block.items():
             if len(nrms) < 2:
                 continue
-            # Sort by length desc so the longest canonical anchors comparisons
-            nrms_sorted = sorted(nrms, key=lambda n: -len(canonical_pool[n]))
+            # Sort by canonical preference so the cleanest canonical anchors comparisons
+            nrms_sorted = sorted(nrms, key=lambda n: canonical_preference_key(canonical_pool[n]))
             for i, a in enumerate(nrms_sorted):
                 for b in nrms_sorted[i + 1:]:
                     canon_a, canon_b = canonical_pool[a], canonical_pool[b]
@@ -481,16 +555,43 @@ def light_normalise_person(s):
 def extract_person_candidate(raw):
     """('Tom Smith (Director of CSY)', '') -> ('Tom Smith', 'Director of CSY').
     Emails are routed through the email-to-name converter, so
-    'jane.smith@dept.gov.uk' becomes ('Jane Smith', '')."""
+    'jane.smith@dept.gov.uk' becomes ('Jane Smith', ''). Joint names
+    ('Tom Smith & Robert Jenkins') are recursed per-component, sorted
+    alphabetically, and rejoined with ' & '."""
     if not isinstance(raw, str) or not raw.strip():
         return ('', '')
     s = raw.strip()
     if is_email(s):
         return (email_to_person_name(s), '')
+    if is_joint(s):
+        cleaned = []
+        notes = []
+        for comp in split_joint(s):
+            comp_cand, comp_note = extract_person_candidate(comp)
+            if comp_cand:
+                cleaned.append(comp_cand)
+            if comp_note:
+                notes.append(comp_note)
+        if cleaned:
+            return (' & '.join(sorted(cleaned, key=str.lower)), '; '.join(notes))
+        return (s, '')
     note_match = PAREN_RE.search(s)
     note = note_match.group(1).strip() if note_match else ''
     s_no_paren = re.sub(r'\s+', ' ', PAREN_RE.sub(' ', s)).strip()
     return (s_no_paren, note)
+
+
+def staff_normalised_key(name):
+    """Bucketing key for staff names. Joint names produce a stable
+    sorted-pipe-joined key so 'Tom Smith & Robert Jenkins' and
+    'Robert Jenkins / Tom Smith' collide in the same bucket."""
+    if not isinstance(name, str):
+        return ''
+    if is_joint(name):
+        parts = [light_normalise_person(p) for p in split_joint(name)]
+        parts = [p for p in parts if p]
+        return '|'.join(sorted(parts))
+    return light_normalise_person(name)
 
 
 def compute_staff_normalisations(raw_names, persistent_staff_map):
@@ -530,11 +631,12 @@ def compute_staff_normalisations(raw_names, persistent_staff_map):
         candidates[raw] = {
             'candidate': cand,
             'parenthetical': note,
-            'normalised': light_normalise_person(cand),
+            'normalised': staff_normalised_key(cand),
             'has_human_intervention': False,
+            'is_joint': is_joint(cand),
         }
 
-    norm_to_persistent = {light_normalise_person(src): dst for src, dst in persistent_staff_map.items()}
+    norm_to_persistent = {staff_normalised_key(src): dst for src, dst in persistent_staff_map.items()}
 
     pending = []
     for raw in unique_raw:
@@ -562,12 +664,12 @@ def compute_staff_normalisations(raw_names, persistent_staff_map):
 
     group_canon = {}
     for nrm, members in norm_groups.items():
-        members_sorted = sorted(members, key=lambda r: -len(candidates[r]['candidate']))
+        members_sorted = sorted(members, key=lambda r: canonical_preference_key(candidates[r]['candidate']))
         group_canon[nrm] = candidates[members_sorted[0]]['candidate']
 
     canonical_pool = {}
     for dst in set(persistent_staff_map.values()):
-        canonical_pool[light_normalise_person(dst)] = dst
+        canonical_pool[staff_normalised_key(dst)] = dst
     for nrm, canon in group_canon.items():
         canonical_pool.setdefault(nrm, canon)
 
@@ -580,11 +682,13 @@ def compute_staff_normalisations(raw_names, persistent_staff_map):
             auto_map[raw] = canon
             auto_log.append({'Raw': raw, 'Canonical': canon, 'Score': 100, 'Reason': 'exact after light_normalise'})
 
-    persistent_dest_nrms = {light_normalise_person(dst) for dst in set(persistent_staff_map.values())}
+    persistent_dest_nrms = {staff_normalised_key(dst) for dst in set(persistent_staff_map.values())}
     if process is not None and len(canonical_pool) > 1:
         pool_by_block = {}
         for nrm, canon in canonical_pool.items():
-            pool_by_block.setdefault(first_token_block_key(canon), []).append(nrm)
+            # Joint keys get their own block so they only compare against other joints.
+            block = '__joint__' if '|' in nrm else first_token_block_key(canon)
+            pool_by_block.setdefault(block, []).append(nrm)
 
         parent = {nrm: nrm for nrm in canonical_pool}
 
@@ -598,7 +702,7 @@ def compute_staff_normalisations(raw_names, persistent_staff_map):
             ra, rb = find(a), find(b)
             if ra == rb:
                 return
-            if len(canonical_pool[ra]) >= len(canonical_pool[rb]):
+            if canonical_preference_key(canonical_pool[ra]) <= canonical_preference_key(canonical_pool[rb]):
                 parent[rb] = ra
             else:
                 parent[ra] = rb
@@ -606,10 +710,13 @@ def compute_staff_normalisations(raw_names, persistent_staff_map):
         for block, nrms in pool_by_block.items():
             if len(nrms) < 2:
                 continue
-            nrms_sorted = sorted(nrms, key=lambda n: -len(canonical_pool[n]))
+            nrms_sorted = sorted(nrms, key=lambda n: canonical_preference_key(canonical_pool[n]))
             for i, a in enumerate(nrms_sorted):
                 for b in nrms_sorted[i + 1:]:
                     canon_a, canon_b = canonical_pool[a], canonical_pool[b]
+                    # Never fuzzy-merge a joint name with a single name.
+                    if ('|' in a) != ('|' in b):
+                        continue
                     score = fuzz.token_set_ratio(a, b)
                     len_ratio = _len_ratio(canon_a, canon_b)
                     if score < 75:
@@ -745,21 +852,76 @@ def calculate_single_group_compliance(group):
     })
 
 
+def _entity_summary(df, group_col):
+    """Shared shell for recipient/offerer summaries — handles the accepted/declined
+    splits and % calculation so both summaries stay in sync."""
+    if group_col not in df.columns or df.empty:
+        return pd.DataFrame()
+    status = df['status'].astype(str).str.lower()
+    accepted_mask = status == 'accepted'
+    declined_mask = status == 'declined'
+    base = df.assign(_accepted=accepted_mask.astype(int), _declined=declined_mask.astype(int))
+    grouped = base.groupby(group_col, dropna=False)
+    out = pd.DataFrame({
+        'num_offers': grouped.size(),
+        'num_accepted': grouped['_accepted'].sum(),
+        '£_accepted': base[accepted_mask].groupby(group_col, dropna=False)['value_parsed_gbp'].sum(),
+        '£_declined': base[declined_mask].groupby(group_col, dropna=False)['value_parsed_gbp'].sum(),
+    })
+    out['£_accepted'] = out['£_accepted'].fillna(0).round(2)
+    out['£_declined'] = out['£_declined'].fillna(0).round(2)
+    out['%_accepted'] = np.where(out['num_offers'] > 0, (out['num_accepted'] / out['num_offers']) * 100, 0).round(1)
+    return out
+
+
+def build_recipient_summary(df):
+    out = _entity_summary(df, 'recipient_name_clean')
+    if out.empty:
+        return out
+    # Top offerer by £ value of accepted offers (falls back to all offers if none accepted).
+    accepted = df[df['status'].astype(str).str.lower() == 'accepted']
+    if not accepted.empty and 'offered_by_org_clean' in accepted.columns:
+        pair_value = accepted.groupby(['recipient_name_clean', 'offered_by_org_clean'])['value_parsed_gbp'].sum()
+        top_offerer = pair_value.groupby(level=0).idxmax().apply(lambda x: x[1] if isinstance(x, tuple) else 'N/A')
+        top_offerer.name = 'top_offerer_by_value'
+        out = out.join(top_offerer)
+        out['top_offerer_by_value'] = out['top_offerer_by_value'].fillna('N/A')
+    else:
+        out['top_offerer_by_value'] = 'N/A'
+    out = out.reset_index().rename(columns={'recipient_name_clean': 'recipient'})
+    cols = ['recipient', 'num_offers', 'num_accepted', '%_accepted', '£_accepted', '£_declined', 'top_offerer_by_value']
+    return out[[c for c in cols if c in out.columns]].sort_values('£_accepted', ascending=False)
+
+
+def build_offerer_summary(df):
+    out = _entity_summary(df, 'offered_by_org_clean')
+    if out.empty:
+        return out
+    grouped = df.groupby('offered_by_org_clean', dropna=False)
+    unique_recipients = grouped['recipient_name_clean'].nunique() if 'recipient_name_clean' in df.columns else pd.Series(dtype=int)
+    unique_directorates = grouped['directorate_clean'].nunique() if 'directorate_clean' in df.columns else pd.Series(dtype=int)
+    out['unique_recipients'] = unique_recipients
+    out['unique_directorates'] = unique_directorates
+    out = out.reset_index().rename(columns={'offered_by_org_clean': 'offerer'})
+    cols = ['offerer', 'num_offers', 'unique_recipients', 'unique_directorates',
+            'num_accepted', '%_accepted', '£_accepted', '£_declined']
+    return out[[c for c in cols if c in out.columns]].sort_values('£_accepted', ascending=False)
+
+
 def generate_compliance_metrics(df):
     report_dfs = {}
-    time_grouping = ['year_declared']
     accepted_df = df[df['status'].str.lower() == 'accepted'].copy()
 
-    accepted_dir = accepted_df.groupby(['directorate_clean'] + time_grouping, dropna=False)['value_parsed_gbp'].agg(['sum', 'mean', 'median', 'max'])
+    accepted_dir = accepted_df.groupby(['directorate_clean'], dropna=False)['value_parsed_gbp'].agg(['sum', 'mean', 'median', 'max'])
     accepted_dir.columns = ['Accepted_' + col for col in accepted_dir.columns]
 
-    declined_dir = df[df['status'].str.lower() == 'declined'].groupby(['directorate_clean'] + time_grouping, dropna=False)['value_parsed_gbp'].agg(['sum', 'mean', 'median', 'max'])
+    declined_dir = df[df['status'].str.lower() == 'declined'].groupby(['directorate_clean'], dropna=False)['value_parsed_gbp'].agg(['sum', 'mean', 'median', 'max'])
     declined_dir.columns = ['Declined_' + col for col in declined_dir.columns]
 
     val_dir = pd.concat([accepted_dir, declined_dir], axis=1, sort=True).fillna(0)
 
     if not accepted_df.empty:
-        group_cols = ['directorate_clean'] + time_grouping
+        group_cols = ['directorate_clean']
         recipient_values = accepted_df.groupby(group_cols + ['recipient_name_clean'])['value_parsed_gbp'].sum()
 
         if not recipient_values.empty:
@@ -781,27 +943,30 @@ def generate_compliance_metrics(df):
         if col in val_dir.columns:
             val_dir[col] = val_dir[col].fillna('N/A' if 'Name' in col else 0)
 
-    report_dfs['Value_by_Directorate_YR'] = val_dir.round(2)
+    report_dfs['Value_by_Directorate'] = val_dir.round(2)
 
-    accepted_cat = accepted_df.groupby(['hospitality_category'] + time_grouping, dropna=False)['value_parsed_gbp'].agg(['count', 'sum', 'mean'])
+    accepted_cat = accepted_df.groupby(['hospitality_category'], dropna=False)['value_parsed_gbp'].agg(['count', 'sum', 'mean'])
     accepted_cat.columns = ['Accepted_Count', 'Accepted_Total_GBP', 'Accepted_Avg_GBP']
     report_dfs['Value_by_Category'] = accepted_cat.round(2)
 
     if 'record_type' in df.columns:
-        rt = accepted_df.groupby(['record_type'] + time_grouping, dropna=False)['value_parsed_gbp'].agg(['count', 'sum', 'mean'])
+        rt = accepted_df.groupby(['record_type'], dropna=False)['value_parsed_gbp'].agg(['count', 'sum', 'mean'])
         rt.columns = ['Accepted_Count', 'Accepted_Total_GBP', 'Accepted_Avg_GBP']
         report_dfs['Value_by_RecordType'] = rt.round(2)
 
     if 'grade' in df.columns:
-        accepted_grade = accepted_df.groupby(['grade'] + time_grouping)['value_parsed_gbp'].agg(['sum', 'mean', 'median', 'max'])
+        accepted_grade = accepted_df.groupby(['grade'])['value_parsed_gbp'].agg(['sum', 'mean', 'median', 'max'])
         accepted_grade.columns = ['Accepted_' + col for col in accepted_grade.columns]
-        declined_grade = df[df['status'].str.lower() == 'declined'].groupby(['grade'] + time_grouping)['value_parsed_gbp'].agg(['sum', 'mean', 'median', 'max'])
+        declined_grade = df[df['status'].str.lower() == 'declined'].groupby(['grade'])['value_parsed_gbp'].agg(['sum', 'mean', 'median', 'max'])
         declined_grade.columns = ['Declined_' + col for col in declined_grade.columns]
         val_grade = pd.concat([accepted_grade, declined_grade], axis=1, sort=True).fillna(0)
-        report_dfs['Value_by_Grade_YR'] = val_grade.round(2)
+        report_dfs['Value_by_Grade'] = val_grade.round(2)
 
-    dir_comp = df.groupby(['directorate_clean'] + time_grouping, dropna=False).apply(calculate_single_group_compliance).round(2).reset_index()
+    dir_comp = df.groupby(['directorate_clean'], dropna=False).apply(calculate_single_group_compliance).round(2).reset_index()
     report_dfs['Compliance_by_Directorate'] = dir_comp
+
+    report_dfs['Recipient_Summary'] = build_recipient_summary(df)
+    report_dfs['Offerer_Summary'] = build_offerer_summary(df)
 
     rankings = {}
     non_compliant_val = df[df['value_parsed_gbp'].isna()]
@@ -882,6 +1047,22 @@ def run_analysis_pipeline():
             staff_map[raw] = canonical
             new_persistent_staff[raw] = canonical
 
+    # Directorate map: auto-applied + cluster acceptances
+    dir_map = dict(st.session_state.get('dir_auto_map', {}))
+    new_persistent_dirs = {}
+    dir_cluster_count = st.session_state.get('dir_cluster_count', 0)
+    for i in range(dir_cluster_count):
+        canonical = st.session_state.get(f"dir_cluster_canon_{i}", '').strip()
+        resolved = st.session_state.get(f"dir_cluster_resolved_{i}")
+        if resolved is None or not canonical:
+            continue
+        for _, row in resolved.iterrows():
+            if not row.get('Include', True):
+                continue
+            raw = row['Raw']
+            dir_map[raw] = canonical
+            new_persistent_dirs[raw] = canonical
+
     if 'recipient_name' in df_processed.columns:
         df_processed['recipient_name_clean'] = df_processed['recipient_name'].map(staff_map).fillna(
             df_processed['recipient_name'].apply(clean_person_name))
@@ -900,7 +1081,11 @@ def run_analysis_pipeline():
     df_processed['declaration_lag_days'] = (df_processed['timestamp'] - df_processed['date_received']).dt.days
 
     df_processed['hospitality_category'] = df_processed['details'].apply(categorize_hospitality)
-    df_processed['directorate_clean'] = df_processed['directorate'].astype(str).str.replace(' & ', ' and ', regex=False).str.strip()
+    if 'directorate' in df_processed.columns:
+        df_processed['directorate_clean'] = df_processed['directorate'].map(dir_map).fillna(
+            df_processed['directorate'].astype(str).str.strip())
+    else:
+        df_processed['directorate_clean'] = pd.NA
 
     if new_persistent_orgs:
         persistent['organizations'].update(new_persistent_orgs)
@@ -910,6 +1095,12 @@ def run_analysis_pipeline():
     new_staff = {k: v for k, v in new_persistent_staff.items() if str(k).strip() != str(v).strip() and v}
     if new_staff:
         persistent['staff'].update(new_staff)
+        save_name_mappings(persistent)
+        st.session_state.name_mappings = persistent
+
+    new_dirs = {k: v for k, v in new_persistent_dirs.items() if str(k).strip() != str(v).strip() and v}
+    if new_dirs:
+        persistent.setdefault('directorates', {}).update(new_dirs)
         save_name_mappings(persistent)
         st.session_state.name_mappings = persistent
 
@@ -934,6 +1125,85 @@ if "mapped_working_df" not in st.session_state:
     st.session_state.mapped_working_df = None
 if "name_mappings" not in st.session_state:
     st.session_state.name_mappings = load_name_mappings()
+
+
+def render_mapping_editor():
+    """Sidebar utility for viewing and editing the persistent name mapping
+    dictionary. Lives outside the pipeline workflow."""
+    persistent = st.session_state.name_mappings
+    with st.sidebar.expander("📚 Manage name mappings", expanded=False):
+        st.caption(f"Stored at `{MAPPING_FILE.name}`. Edits are written on Save.")
+        tab_o, tab_s, tab_d, tab_l, tab_f = st.tabs([
+            "Organizations", "Staff", "Directorates", "Legacy", "Forced clusters"
+        ])
+
+        for label, key, tab in [("Organizations", "organizations", tab_o),
+                                ("Staff", "staff", tab_s),
+                                ("Directorates", "directorates", tab_d)]:
+            with tab:
+                current = persistent.get(key, {})
+                edit_df = pd.DataFrame(
+                    [{'Raw Entry': k, 'Canonical': v} for k, v in sorted(current.items())]
+                    or [{'Raw Entry': '', 'Canonical': ''}]
+                )
+                edited = st.data_editor(
+                    edit_df,
+                    num_rows='dynamic',
+                    use_container_width=True,
+                    key=f'sidebar_persistent_editor_{key}',
+                )
+                if st.button(f"Save {label}", key=f'sidebar_save_{key}'):
+                    new_map = {
+                        str(row['Raw Entry']).strip(): str(row['Canonical']).strip()
+                        for _, row in edited.iterrows()
+                        if str(row.get('Raw Entry', '')).strip() and str(row.get('Canonical', '')).strip()
+                    }
+                    persistent[key] = new_map
+                    if save_name_mappings(persistent):
+                        st.success(f"Saved {len(new_map)} {label.lower()} entries.")
+
+        with tab_l:
+            st.caption("Legacy entries from earlier versions — read-only here. "
+                       "Edit `name_mappings.json` directly if you need to change them.")
+            legacy_rows = []
+            for src_key in ('recipients', 'approvers'):
+                for k, v in sorted(persistent.get(src_key, {}).items()):
+                    legacy_rows.append({'Source': src_key, 'Raw Entry': k, 'Canonical': v})
+            if legacy_rows:
+                st.dataframe(pd.DataFrame(legacy_rows), use_container_width=True, hide_index=True)
+            else:
+                st.write("_No legacy entries._")
+
+        with tab_f:
+            st.caption("Force two raw entries into the same cluster regardless of fuzzy match. "
+                       "The cleaner of the two values is used as the canonical.")
+            for scope_label, scope_key in [("Organizations", "organizations"),
+                                            ("Staff", "staff"),
+                                            ("Directorates", "directorates")]:
+                st.markdown(f"**{scope_label}**")
+                pairs = persistent.get('forced_clusters', {}).get(scope_key, [])
+                pair_df = pd.DataFrame(
+                    [{'A': a, 'B': b} for a, b in pairs]
+                    or [{'A': '', 'B': ''}]
+                )
+                edited_pairs = st.data_editor(
+                    pair_df,
+                    num_rows='dynamic',
+                    use_container_width=True,
+                    key=f'sidebar_forced_{scope_key}',
+                )
+                if st.button(f"Save {scope_label} forced pairs", key=f'sidebar_save_forced_{scope_key}'):
+                    new_pairs = [
+                        [str(row['A']).strip(), str(row['B']).strip()]
+                        for _, row in edited_pairs.iterrows()
+                        if str(row.get('A', '')).strip() and str(row.get('B', '')).strip()
+                    ]
+                    persistent.setdefault('forced_clusters', {})[scope_key] = new_pairs
+                    if save_name_mappings(persistent):
+                        st.success(f"Saved {len(new_pairs)} {scope_label.lower()} forced pair(s).")
+
+
+render_mapping_editor()
 
 # --- STEP 1: FILE UPLOADER ---
 uploaded_files = st.file_uploader("Upload Hospitality CSV Registers", type=["csv"], accept_multiple_files=True)
@@ -1063,8 +1333,10 @@ if st.session_state.stage in ["mapping", "normalization", "analysis"] and st.ses
 
             # Run tiered org normalisation
             persistent = st.session_state.name_mappings
+            forced = persistent.get('forced_clusters', {}) or {}
             raw_orgs = mapped_df['offered_by_org'].dropna().unique().tolist() if 'offered_by_org' in mapped_df.columns else []
-            auto_map, auto_log, review_records = compute_org_normalisations(raw_orgs, persistent.get('organizations', {}))
+            org_persistent = apply_forced_clusters(persistent.get('organizations', {}), forced.get('organizations', []))
+            auto_map, auto_log, review_records = compute_org_normalisations(raw_orgs, org_persistent)
 
             # Annotate review records with value + directorate metrics for risk-weighted sorting
             value_lookup = mapped_df.groupby('offered_by_org')['value_parsed_gbp'].sum().to_dict() if 'offered_by_org' in mapped_df.columns else {}
@@ -1082,8 +1354,9 @@ if st.session_state.stage in ["mapping", "normalization", "analysis"] and st.ses
             recip_uniques = set(mapped_df['recipient_name'].dropna().unique()) if 'recipient_name' in mapped_df.columns else set()
             approver_uniques = set(mapped_df['approver_name'].dropna().unique()) if 'approver_name' in mapped_df.columns else set()
             raw_staff = sorted(recip_uniques | approver_uniques)
+            staff_persistent = apply_forced_clusters(get_staff_map(persistent), forced.get('staff', []))
             staff_auto_map, staff_auto_log, staff_review_records = compute_staff_normalisations(
-                raw_staff, get_staff_map(persistent)
+                raw_staff, staff_persistent
             )
 
             # Risk-weighted metadata: sum value/count/dir-spread across BOTH roles
@@ -1107,6 +1380,22 @@ if st.session_state.stage in ["mapping", "normalization", "analysis"] and st.ses
             st.session_state.staff_value_lookup = staff_value_lookup
             st.session_state.staff_count_lookup = staff_count_lookup
             st.session_state.staff_dir_lookup = staff_dir_lookup
+
+            # Directorate normalisation (reuses the org pipeline; directorates have
+            # the same short-phrase shape and rarely carry 'courtesy of' semantics).
+            raw_dirs = mapped_df['directorate'].dropna().unique().tolist() if 'directorate' in mapped_df.columns else []
+            dir_persistent = apply_forced_clusters(persistent.get('directorates', {}), forced.get('directorates', []))
+            dir_auto_map, dir_auto_log, dir_review_records = compute_org_normalisations(
+                raw_dirs, dir_persistent
+            )
+            dir_value_lookup = mapped_df.groupby('directorate')['value_parsed_gbp'].sum().to_dict() if 'directorate' in mapped_df.columns else {}
+            dir_count_lookup = mapped_df['directorate'].value_counts().to_dict() if 'directorate' in mapped_df.columns else {}
+
+            st.session_state.dir_auto_map = dir_auto_map
+            st.session_state.dir_auto_log = pd.DataFrame(dir_auto_log)
+            st.session_state.dir_review_records = dir_review_records
+            st.session_state.dir_value_lookup = dir_value_lookup
+            st.session_state.dir_count_lookup = dir_count_lookup
 
             st.session_state.stage = "normalization"
 
@@ -1285,37 +1574,78 @@ if st.session_state.stage in ["normalization", "analysis"] and st.session_state.
         st.session_state.staff_cluster_count = len(sorted_staff_clusters)
         st.session_state.staff_cluster_proposed = [p for p, _ in sorted_staff_clusters]
 
-    # Persistent dictionary management
-    with st.expander("📚 Manual mappings (persistent across sessions)", expanded=False):
-        st.caption(f"Stored at `{MAPPING_FILE}`. Edits here are written immediately on Save.")
-        tab_o, tab_s = st.tabs(["Organizations", "Staff"])
-        if persistent.get('recipients') or persistent.get('approvers'):
-            with tab_s:
-                st.caption("Legacy Recipients/Approvers entries from earlier versions are still respected on read "
-                           "(see `name_mappings.json` directly). New entries below land in the unified 'staff' map.")
-        for label, key, tab in [("Organizations", "organizations", tab_o),
-                                 ("Staff", "staff", tab_s)]:
-            with tab:
-                current = persistent.get(key, {})
-                edit_df = pd.DataFrame(
-                    [{'Raw Entry': k, 'Canonical': v} for k, v in sorted(current.items())]
-                    or [{'Raw Entry': '', 'Canonical': ''}]
+    # Directorate cluster review
+    dir_auto_log_df = st.session_state.get('dir_auto_log', pd.DataFrame())
+    if not dir_auto_log_df.empty:
+        with st.expander(f"✅ Auto-applied directorate merges ({len(dir_auto_log_df)} entries)", expanded=False):
+            st.caption("Silent merges: manual-map hits and exact-after-normalise duplicates.")
+            st.dataframe(dir_auto_log_df, use_container_width=True)
+
+    st.subheader("Directorate cluster review")
+    dir_review_records = st.session_state.get('dir_review_records', [])
+    dir_value_lookup = st.session_state.get('dir_value_lookup', {})
+    dir_count_lookup = st.session_state.get('dir_count_lookup', {})
+
+    if not dir_review_records:
+        st.success("No directorate name pairs require review.")
+        st.session_state.dir_cluster_count = 0
+    else:
+        dir_clusters = {}
+        for rec in dir_review_records:
+            dir_clusters.setdefault(rec['Proposed_Canonical'], []).append(rec)
+
+        def dir_cluster_metrics(members):
+            total_value = sum(dir_value_lookup.get(m['Raw'], 0) or 0 for m in members)
+            total_count = sum(dir_count_lookup.get(m['Raw'], 0) or 0 for m in members)
+            return total_value, total_count
+
+        sorted_dir_clusters = sorted(
+            dir_clusters.items(),
+            key=lambda kv: (dir_cluster_metrics(kv[1])[0], dir_cluster_metrics(kv[1])[1]),
+            reverse=True,
+        )
+
+        st.caption("Edit the canonical directorate name or untick variants to leave them as their own.")
+
+        for i, (proposed, members) in enumerate(sorted_dir_clusters):
+            total_value, total_count = dir_cluster_metrics(members)
+            flags = sorted({f for m in members for f in m['Flags'].split(', ') if f})
+            header = f"**{proposed}** — {len(members)} variant(s), {total_count} rows, £{total_value:,.0f}"
+            if flags:
+                header += f" · flags: {', '.join(flags)}"
+            with st.expander(header, expanded=False):
+                st.text_input(
+                    "Canonical directorate",
+                    value=proposed,
+                    key=f"dir_cluster_canon_{i}",
                 )
+                member_df = pd.DataFrame([{
+                    'Include': True,
+                    'Raw': m['Raw'],
+                    'Score': m['Score'],
+                    'Len ratio': m['Length_Ratio'],
+                    'Flags': m['Flags'],
+                    'Rows': dir_count_lookup.get(m['Raw'], 0),
+                    '£ total': dir_value_lookup.get(m['Raw'], 0) or 0,
+                } for m in members])
                 edited = st.data_editor(
-                    edit_df,
-                    num_rows='dynamic',
+                    member_df,
+                    column_config={
+                        'Include': st.column_config.CheckboxColumn(help="Untick to leave this raw as its own value"),
+                        'Raw': st.column_config.TextColumn(disabled=True),
+                        'Score': st.column_config.NumberColumn(disabled=True),
+                        'Len ratio': st.column_config.NumberColumn(disabled=True),
+                        'Flags': st.column_config.TextColumn(disabled=True),
+                        'Rows': st.column_config.NumberColumn(disabled=True),
+                        '£ total': st.column_config.NumberColumn(format='£%.0f', disabled=True),
+                    },
+                    hide_index=True,
                     use_container_width=True,
-                    key=f'persistent_editor_{key}',
+                    key=f"dir_cluster_members_{i}",
                 )
-                if st.button(f"Save {label}", key=f'save_{key}'):
-                    new_map = {
-                        str(row['Raw Entry']).strip(): str(row['Canonical']).strip()
-                        for _, row in edited.iterrows()
-                        if str(row.get('Raw Entry', '')).strip() and str(row.get('Canonical', '')).strip()
-                    }
-                    persistent[key] = new_map
-                    if save_name_mappings(persistent):
-                        st.success(f"Saved {len(new_map)} {label.lower()} mapping(s) to {MAPPING_FILE.name}")
+                st.session_state[f"dir_cluster_resolved_{i}"] = edited
+        st.session_state.dir_cluster_count = len(sorted_dir_clusters)
+        st.session_state.dir_cluster_proposed = [p for p, _ in sorted_dir_clusters]
 
     if st.button("Apply Normalisations & Run Pipeline", type="primary"):
         # Collect orphans before applying. An "orphan" is a cluster member the
@@ -1441,6 +1771,18 @@ if st.session_state.stage == "analysis" and "final_reports" in st.session_state:
     proc_df = st.session_state.df_processed
     reports = st.session_state.final_reports
 
+    date_label_map = {'timestamp': 'Timestamp (date logged)', 'date_received': 'Date of event'}
+    st.radio(
+        "Primary date column",
+        options=['timestamp', 'date_received'],
+        format_func=lambda v: date_label_map.get(v, v),
+        key='date_toggle',
+        horizontal=True,
+        help="Controls the date column shown in recipient/offerer drill-downs and the cleaned-register export. "
+             "Summary aggregations are not affected.",
+    )
+    date_col = st.session_state.get('date_toggle', 'timestamp')
+
     c1, c2, c3, c4 = st.columns(4)
     with c1:
         st.metric("Total Rows Evaluated", len(proc_df))
@@ -1453,18 +1795,20 @@ if st.session_state.stage == "analysis" and "final_reports" in st.session_state:
         med_lag = proc_df['declaration_lag_days'].median()
         st.metric("Median Declaration Lag", f"{med_lag:.1f} Days" if pd.notna(med_lag) else "N/A")
 
-    t1, t2, t3, t4, t5, t6 = st.tabs([
+    t1, t2, t3, t4, t5, t6, t7, t8 = st.tabs([
         "Directorate & Category",
         "Grade Analysis",
         "Compliance Metrics",
         "Risk Rankings",
         "Group Events & High-Freq",
         "Data Quality Logs",
+        "Recipient Analysis",
+        "Offerer Analysis",
     ])
 
     with t1:
         st.subheader("Value Summary by Directorate")
-        st.dataframe(reports.get('Value_by_Directorate_YR'), use_container_width=True)
+        st.dataframe(reports.get('Value_by_Directorate'), use_container_width=True)
         st.subheader("Value Summary by Category")
         st.dataframe(reports.get('Value_by_Category'), use_container_width=True)
         if 'Value_by_RecordType' in reports:
@@ -1472,9 +1816,9 @@ if st.session_state.stage == "analysis" and "final_reports" in st.session_state:
             st.dataframe(reports.get('Value_by_RecordType'), use_container_width=True)
 
     with t2:
-        if 'Value_by_Grade_YR' in reports:
+        if 'Value_by_Grade' in reports:
             st.subheader("Value Breakdown Across Grades")
-            st.dataframe(reports.get('Value_by_Grade_YR'), use_container_width=True)
+            st.dataframe(reports.get('Value_by_Grade'), use_container_width=True)
         else:
             st.info("Grade analysis was omitted or grade column was not mapped.")
 
@@ -1508,6 +1852,39 @@ if st.session_state.stage == "analysis" and "final_reports" in st.session_state:
         else:
             st.success("Clean data — no quality issues detected.")
 
+    drill_cols_recipient = [date_col, 'recipient_name_clean', 'directorate_clean', 'offered_by_org_clean',
+                            'status', 'value_parsed_gbp', 'hospitality_category', 'record_type', 'details']
+    drill_cols_offerer = [date_col, 'offered_by_org_clean', 'recipient_name_clean', 'directorate_clean',
+                          'status', 'value_parsed_gbp', 'hospitality_category', 'record_type', 'details']
+
+    with t7:
+        st.subheader("Recipient Analysis")
+        recipient_summary = reports.get('Recipient_Summary')
+        if recipient_summary is None or recipient_summary.empty:
+            st.info("No recipient data to summarise.")
+        else:
+            st.dataframe(recipient_summary, use_container_width=True, hide_index=True)
+            options = recipient_summary['recipient'].tolist()
+            picked = st.selectbox("Drill down on recipient", options, key='recipient_drill_select')
+            if picked is not None:
+                drill = proc_df[proc_df['recipient_name_clean'] == picked]
+                cols = [c for c in drill_cols_recipient if c in drill.columns]
+                st.dataframe(drill[cols].sort_values(date_col, ascending=False), use_container_width=True, hide_index=True)
+
+    with t8:
+        st.subheader("Offerer Analysis")
+        offerer_summary = reports.get('Offerer_Summary')
+        if offerer_summary is None or offerer_summary.empty:
+            st.info("No offerer data to summarise.")
+        else:
+            st.dataframe(offerer_summary, use_container_width=True, hide_index=True)
+            options = offerer_summary['offerer'].tolist()
+            picked = st.selectbox("Drill down on offerer", options, key='offerer_drill_select')
+            if picked is not None:
+                drill = proc_df[proc_df['offered_by_org_clean'] == picked]
+                cols = [c for c in drill_cols_offerer if c in drill.columns]
+                st.dataframe(drill[cols].sort_values(date_col, ascending=False), use_container_width=True, hide_index=True)
+
     # ---- EXPORTS ----
     st.divider()
     st.subheader("📥 Exports")
@@ -1517,16 +1894,20 @@ if st.session_state.stage == "analysis" and "final_reports" in st.session_state:
     ec1, ec2 = st.columns(2)
 
     with ec1:
+        export_df = proc_df.copy()
+        if date_col in export_df.columns:
+            cols = [date_col] + [c for c in export_df.columns if c != date_col]
+            export_df = export_df[cols]
         cleaned_buffer = io.BytesIO()
         with pd.ExcelWriter(cleaned_buffer, engine='openpyxl') as writer:
-            proc_df.to_excel(writer, sheet_name='cleaned_register', index=False)
+            export_df.to_excel(writer, sheet_name='cleaned_register', index=False)
         st.download_button(
             label="Download Cleaned Register (.xlsx)",
             data=cleaned_buffer.getvalue(),
             file_name=f"cleaned_register_{ts}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            help="Post-clean, post-normalisation register: one row per input row with all derived "
-                 "columns (*_clean, value_parsed_gbp, hospitality_category, record_type).",
+            help="Post-clean, post-normalisation register. The first column follows the "
+                 "'Primary date column' toggle above.",
         )
 
     with ec2:
