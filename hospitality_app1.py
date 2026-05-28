@@ -1859,8 +1859,8 @@ if st.session_state.stage == "analysis" and "final_reports" in st.session_state:
         format_func=lambda v: date_label_map.get(v, v),
         key='date_toggle',
         horizontal=True,
-        help="Controls the date column shown in recipient/offerer drill-downs and the cleaned-register export. "
-             "Summary aggregations are not affected.",
+        help="Sort key for the recipient/offerer drill-down tables, and lead column of the cleaned-register export. "
+             "Both date columns remain visible. Summary aggregations are not affected.",
     )
     date_col = st.session_state.get('date_toggle', 'timestamp')
 
@@ -1933,10 +1933,49 @@ if st.session_state.stage == "analysis" and "final_reports" in st.session_state:
         else:
             st.success("Clean data — no quality issues detected.")
 
-    drill_cols_recipient = [date_col, 'recipient_name_clean', 'directorate_clean', 'offered_by_org_clean',
-                            'status', 'value_parsed_gbp', 'hospitality_category', 'record_type', 'details']
-    drill_cols_offerer = [date_col, 'offered_by_org_clean', 'recipient_name_clean', 'directorate_clean',
-                          'status', 'value_parsed_gbp', 'hospitality_category', 'record_type', 'details']
+    drill_cols_recipient = ['timestamp', 'date_received', 'directorate_clean', 'offered_by_org_clean',
+                            'status', 'reason', 'value_parsed_gbp', 'declaration_lag_days',
+                            'hospitality_category', 'record_type', 'details']
+    drill_cols_offerer = ['timestamp', 'date_received', 'offered_by_org_clean', 'recipient_name_clean',
+                          'directorate_clean', 'status', 'reason', 'value_parsed_gbp',
+                          'declaration_lag_days', 'hospitality_category', 'record_type', 'details']
+
+    # Inject CSS once so the long 'details' column wraps inside the static
+    # drill-down tables (Streamlit's canvas-based st.dataframe won't wrap).
+    st.markdown(
+        """
+        <style>
+        [data-testid="stTable"] table { table-layout: fixed; width: 100%; }
+        [data-testid="stTable"] td, [data-testid="stTable"] th {
+            white-space: normal !important;
+            vertical-align: top;
+            word-wrap: break-word;
+            overflow-wrap: anywhere;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    drill_label_map = {
+        'timestamp': 'Date logged',
+        'date_received': 'Event date',
+        'recipient_name_clean': 'Recipient',
+        'offered_by_org_clean': 'Offerer',
+        'directorate_clean': 'Directorate',
+        'value_parsed_gbp': '£',
+        'declaration_lag_days': 'Lag (days)',
+        'hospitality_category': 'Category',
+        'record_type': 'Type',
+        'status': 'Status',
+        'reason': 'Reason',
+        'details': 'Details',
+    }
+
+    def render_drill(df, cols, sort_col):
+        present = [c for c in cols if c in df.columns]
+        view = df[present].sort_values(sort_col, ascending=False) if sort_col in df.columns else df[present]
+        st.table(view.rename(columns=drill_label_map).reset_index(drop=True))
 
     with t7:
         st.subheader("Recipient Analysis")
@@ -1949,8 +1988,7 @@ if st.session_state.stage == "analysis" and "final_reports" in st.session_state:
             picked = st.selectbox("Drill down on recipient", options, key='recipient_drill_select')
             if picked is not None:
                 drill = proc_df[proc_df['recipient_name_clean'] == picked]
-                cols = [c for c in drill_cols_recipient if c in drill.columns]
-                st.dataframe(drill[cols].sort_values(date_col, ascending=False), use_container_width=True, hide_index=True)
+                render_drill(drill, drill_cols_recipient, date_col)
 
     with t8:
         st.subheader("Offerer Analysis")
@@ -1963,8 +2001,7 @@ if st.session_state.stage == "analysis" and "final_reports" in st.session_state:
             picked = st.selectbox("Drill down on offerer", options, key='offerer_drill_select')
             if picked is not None:
                 drill = proc_df[proc_df['offered_by_org_clean'] == picked]
-                cols = [c for c in drill_cols_offerer if c in drill.columns]
-                st.dataframe(drill[cols].sort_values(date_col, ascending=False), use_container_width=True, hide_index=True)
+                render_drill(drill, drill_cols_offerer, date_col)
 
     # ---- EXPORTS ----
     st.divider()
