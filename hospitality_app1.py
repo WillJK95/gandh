@@ -1940,42 +1940,30 @@ if st.session_state.stage == "analysis" and "final_reports" in st.session_state:
                           'directorate_clean', 'status', 'reason', 'value_parsed_gbp',
                           'declaration_lag_days', 'hospitality_category', 'record_type', 'details']
 
-    # Inject CSS once so the long 'details' column wraps inside the static
-    # drill-down tables (Streamlit's canvas-based st.dataframe won't wrap).
-    st.markdown(
-        """
-        <style>
-        [data-testid="stTable"] table { table-layout: fixed; width: 100%; }
-        [data-testid="stTable"] td, [data-testid="stTable"] th {
-            white-space: normal !important;
-            vertical-align: top;
-            word-wrap: break-word;
-            overflow-wrap: anywhere;
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    drill_label_map = {
-        'timestamp': 'Date logged',
-        'date_received': 'Event date',
-        'recipient_name_clean': 'Recipient',
-        'offered_by_org_clean': 'Offerer',
-        'directorate_clean': 'Directorate',
-        'value_parsed_gbp': '£',
-        'declaration_lag_days': 'Lag (days)',
-        'hospitality_category': 'Category',
-        'record_type': 'Type',
-        'status': 'Status',
-        'reason': 'Reason',
-        'details': 'Details',
+    drill_column_config = {
+        'timestamp': st.column_config.DatetimeColumn(label='Date logged', format='YYYY-MM-DD'),
+        'date_received': st.column_config.DatetimeColumn(label='Event date', format='YYYY-MM-DD'),
+        'recipient_name_clean': st.column_config.TextColumn(label='Recipient', width='medium'),
+        'offered_by_org_clean': st.column_config.TextColumn(label='Offerer', width='medium'),
+        'directorate_clean': st.column_config.TextColumn(label='Directorate', width='medium'),
+        'status': st.column_config.TextColumn(label='Status', width='small'),
+        'reason': st.column_config.TextColumn(label='Reason', width='medium'),
+        'value_parsed_gbp': st.column_config.NumberColumn(label='£', format='£%.2f', width='small'),
+        'declaration_lag_days': st.column_config.NumberColumn(label='Lag (days)', width='small'),
+        'hospitality_category': st.column_config.TextColumn(label='Category', width='small'),
+        'record_type': st.column_config.TextColumn(label='Type', width='small'),
+        'details': st.column_config.TextColumn(label='Details', width='large'),
     }
 
     def render_drill(df, cols, sort_col):
         present = [c for c in cols if c in df.columns]
         view = df[present].sort_values(sort_col, ascending=False) if sort_col in df.columns else df[present]
-        st.table(view.rename(columns=drill_label_map).reset_index(drop=True))
+        st.dataframe(
+            view,
+            column_config={k: v for k, v in drill_column_config.items() if k in present},
+            use_container_width=True,
+            hide_index=True,
+        )
 
     with t7:
         st.subheader("Recipient Analysis")
@@ -1989,6 +1977,21 @@ if st.session_state.stage == "analysis" and "final_reports" in st.session_state:
             if picked is not None:
                 drill = proc_df[proc_df['recipient_name_clean'] == picked]
                 render_drill(drill, drill_cols_recipient, date_col)
+                with st.expander("Read details in full"):
+                    for _, r in drill.sort_values(date_col, ascending=False).iterrows():
+                        d_logged = r.get('timestamp')
+                        d_event = r.get('date_received')
+                        st.markdown(
+                            f"**{r.get('offered_by_org_clean','?')}** · "
+                            f"logged {pd.to_datetime(d_logged).date() if pd.notna(d_logged) else '—'} · "
+                            f"event {pd.to_datetime(d_event).date() if pd.notna(d_event) else '—'} · "
+                            f"{r.get('status','?')} · £{(r.get('value_parsed_gbp') or 0):,.2f}"
+                        )
+                        if pd.notna(r.get('details')):
+                            st.write(r['details'])
+                        if pd.notna(r.get('reason')):
+                            st.caption(f"Reason: {r['reason']}")
+                        st.divider()
 
     with t8:
         st.subheader("Offerer Analysis")
@@ -2002,6 +2005,21 @@ if st.session_state.stage == "analysis" and "final_reports" in st.session_state:
             if picked is not None:
                 drill = proc_df[proc_df['offered_by_org_clean'] == picked]
                 render_drill(drill, drill_cols_offerer, date_col)
+                with st.expander("Read details in full"):
+                    for _, r in drill.sort_values(date_col, ascending=False).iterrows():
+                        d_logged = r.get('timestamp')
+                        d_event = r.get('date_received')
+                        st.markdown(
+                            f"**{r.get('recipient_name_clean','?')}** · "
+                            f"logged {pd.to_datetime(d_logged).date() if pd.notna(d_logged) else '—'} · "
+                            f"event {pd.to_datetime(d_event).date() if pd.notna(d_event) else '—'} · "
+                            f"{r.get('status','?')} · £{(r.get('value_parsed_gbp') or 0):,.2f}"
+                        )
+                        if pd.notna(r.get('details')):
+                            st.write(r['details'])
+                        if pd.notna(r.get('reason')):
+                            st.caption(f"Reason: {r['reason']}")
+                        st.divider()
 
     # ---- EXPORTS ----
     st.divider()
