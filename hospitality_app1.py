@@ -123,11 +123,6 @@ def parse_value(value_str):
         return np.nan
     if any(term in value_str for term in ['n/a', 'unknown', 'nil', 'unclear', 'unsure', 'free', 'no gift', 'not known']):
         return np.nan
-    if '65 gbp' in value_str:
-        return 65.0
-    if '47 or 35' in value_str:
-        return 47.0
-
     currency_numbers = [float(num.replace(',', '')) for num in re.findall(r'(?:£|gbp)\s*(\d[\d,.]*)', value_str)]
     if not currency_numbers:
         currency_numbers = [float(num.replace(',', '')) for num in re.findall(r'(\d[\d,.]*)\s*(?:£|gbp)', value_str)]
@@ -200,6 +195,16 @@ def split_joint(name):
         return []
     parts = [p.strip() for p in JOINT_SEP_RE.split(name)]
     return [p for p in parts if p]
+
+
+def safe_widget_key(text):
+    """Sanitise a string into a stable Streamlit widget key suffix. Cluster
+    review widgets use this so unticking a member doesn't shift integer
+    indices and scramble user edits across rows."""
+    if not isinstance(text, str):
+        text = str(text)
+    out = re.sub(r'[^a-zA-Z0-9]+', '_', text.lower()).strip('_')
+    return (out or 'empty')[:80]
 
 
 def canonical_preference_key(name):
@@ -962,7 +967,9 @@ def generate_compliance_metrics(df):
         val_grade = pd.concat([accepted_grade, declined_grade], axis=1, sort=True).fillna(0)
         report_dfs['Value_by_Grade'] = val_grade.round(2)
 
-    dir_comp = df.groupby(['directorate_clean'], dropna=False).apply(calculate_single_group_compliance).round(2).reset_index()
+    dir_comp = df.groupby(['directorate_clean'], dropna=False).apply(
+        calculate_single_group_compliance, include_groups=False
+    ).round(2).reset_index()
     report_dfs['Compliance_by_Directorate'] = dir_comp
 
     report_dfs['Recipient_Summary'] = build_recipient_summary(df)
@@ -1004,21 +1011,23 @@ def run_analysis_pipeline():
     df_processed = st.session_state.mapped_working_df.copy()
     persistent = st.session_state.name_mappings
 
+    def collect_cluster_overrides(keys_state, prefix):
+        accepted = {}
+        for ck in st.session_state.get(keys_state, []):
+            canonical = st.session_state.get(f"{prefix}_canon_{ck}", '').strip()
+            resolved = st.session_state.get(f"{prefix}_resolved_{ck}")
+            if resolved is None or not canonical:
+                continue
+            for _, row in resolved.iterrows():
+                if not row.get('Include', True):
+                    continue
+                accepted[row['Raw']] = canonical
+        return accepted
+
     # Build final org_map: auto-applied + cluster acceptances + orphan overrides
     org_map = dict(st.session_state.get('org_auto_map', {}))
-    new_persistent_orgs = {}
-    cluster_count = st.session_state.get('cluster_count', 0)
-    for i in range(cluster_count):
-        canonical = st.session_state.get(f"cluster_canon_{i}", '').strip()
-        resolved = st.session_state.get(f"cluster_resolved_{i}")
-        if resolved is None or not canonical:
-            continue
-        for _, row in resolved.iterrows():
-            if not row.get('Include', True):
-                continue
-            raw = row['Raw']
-            org_map[raw] = canonical
-            new_persistent_orgs[raw] = canonical
+    new_persistent_orgs = collect_cluster_overrides('cluster_keys', 'cluster')
+    org_map.update(new_persistent_orgs)
 
     # Orphan overrides: only persist if mapped onto an existing canonical (not
     # singleton, not freshly-coined). Existing canonicals = anything already in
@@ -1033,35 +1042,13 @@ def run_analysis_pipeline():
 
     # Shared staff map: auto-applied + cluster acceptances
     staff_map = dict(st.session_state.get('staff_auto_map', {}))
-    new_persistent_staff = {}
-    staff_cluster_count = st.session_state.get('staff_cluster_count', 0)
-    for i in range(staff_cluster_count):
-        canonical = st.session_state.get(f"staff_cluster_canon_{i}", '').strip()
-        resolved = st.session_state.get(f"staff_cluster_resolved_{i}")
-        if resolved is None or not canonical:
-            continue
-        for _, row in resolved.iterrows():
-            if not row.get('Include', True):
-                continue
-            raw = row['Raw']
-            staff_map[raw] = canonical
-            new_persistent_staff[raw] = canonical
+    new_persistent_staff = collect_cluster_overrides('staff_cluster_keys', 'staff_cluster')
+    staff_map.update(new_persistent_staff)
 
     # Directorate map: auto-applied + cluster acceptances
     dir_map = dict(st.session_state.get('dir_auto_map', {}))
-    new_persistent_dirs = {}
-    dir_cluster_count = st.session_state.get('dir_cluster_count', 0)
-    for i in range(dir_cluster_count):
-        canonical = st.session_state.get(f"dir_cluster_canon_{i}", '').strip()
-        resolved = st.session_state.get(f"dir_cluster_resolved_{i}")
-        if resolved is None or not canonical:
-            continue
-        for _, row in resolved.iterrows():
-            if not row.get('Include', True):
-                continue
-            raw = row['Raw']
-            dir_map[raw] = canonical
-            new_persistent_dirs[raw] = canonical
+    new_persistent_dirs = collect_cluster_overrides('dir_cluster_keys', 'dir_cluster')
+    dir_map.update(new_persistent_dirs)
 
     if 'recipient_name' in df_processed.columns:
         df_processed['recipient_name_clean'] = df_processed['recipient_name'].map(staff_map).fillna(
@@ -1212,12 +1199,31 @@ if uploaded_files:
     if st.button("Load and Combine Files", type="primary") or st.session_state.raw_df is not None:
         if st.session_state.raw_df is None:
             dfs = []
+            file_cols = []
             for file in uploaded_files:
                 try:
-                    dfs.append(pd.read_csv(file))
+                    file_df = pd.read_csv(file)
+                    dfs.append(file_df)
+                    file_cols.append((file.name, set(file_df.columns)))
                 except Exception as e:
                     st.error(f"Error loading {file.name}: {e}")
             if dfs:
+                # Warn if column sets diverge — pd.concat will outer-join columns
+                # and silently fill missing cells with NaN, which can drop whole
+                # files' worth of data behind a column-mapping selection.
+                if len(file_cols) > 1:
+                    common = set.intersection(*(c for _, c in file_cols))
+                    diverging = [(n, sorted(c - common)) for n, c in file_cols if c - common]
+                    if diverging:
+                        st.warning(
+                            "Uploaded files have different column sets. Columns that "
+                            "exist in some files but not others will become NaN for the "
+                            "missing files after combining. Rename headers to match before "
+                            "uploading, or upload separately."
+                        )
+                        with st.expander("Column differences per file", expanded=False):
+                            for name, extra in diverging:
+                                st.markdown(f"**{name}** — extra columns: `{', '.join(extra) or '(none)'}`")
                 st.session_state.raw_df = pd.concat(dfs, ignore_index=True).dropna(how='all')
                 st.session_state.stage = "mapping"
                 st.success(f"Combined {len(dfs)} file(s). Total combined rows: {len(st.session_state.raw_df)}")
@@ -1447,7 +1453,17 @@ if st.session_state.stage in ["normalization", "analysis"] and st.session_state.
         st.caption("Clusters sorted by total £ value (counter-fraud risk weighting). "
                    "Edit the canonical text or untick members to split them out of the cluster.")
 
-        for i, (proposed, members) in enumerate(sorted_clusters):
+        cluster_keys = []
+        cluster_proposed_by_key = {}
+        seen_keys = {}
+        for proposed, members in sorted_clusters:
+            base = safe_widget_key(proposed)
+            n = seen_keys.get(base, 0)
+            ck = base if n == 0 else f"{base}_{n}"
+            seen_keys[base] = n + 1
+            cluster_keys.append(ck)
+            cluster_proposed_by_key[ck] = proposed
+
             total_value, total_count, dir_spread = cluster_metrics(members)
             flags = sorted({f for m in members for f in m['Flags'].split(', ') if f})
             header = f"**{proposed}** — {len(members)} variant(s), {total_count} rows, £{total_value:,.0f} accepted/declared"
@@ -1457,7 +1473,7 @@ if st.session_state.stage in ["normalization", "analysis"] and st.session_state.
                 st.text_input(
                     "Canonical name",
                     value=proposed,
-                    key=f"cluster_canon_{i}",
+                    key=f"cluster_canon_{ck}",
                 )
                 member_df = pd.DataFrame([{
                     'Include': True,
@@ -1483,12 +1499,11 @@ if st.session_state.stage in ["normalization", "analysis"] and st.session_state.
                     },
                     hide_index=True,
                     use_container_width=True,
-                    key=f"cluster_members_{i}",
+                    key=f"cluster_members_{ck}",
                 )
-                # Stash the resolved members for the apply step
-                st.session_state[f"cluster_resolved_{i}"] = edited
-        st.session_state.cluster_count = len(sorted_clusters)
-        st.session_state.cluster_proposed = [p for p, _ in sorted_clusters]
+                st.session_state[f"cluster_resolved_{ck}"] = edited
+        st.session_state.cluster_keys = cluster_keys
+        st.session_state.cluster_proposed_by_key = cluster_proposed_by_key
         # Per-canonical (member_count, total_value) — used by the orphan-review stage
         st.session_state.cluster_metrics_map = {
             proposed: (len(members), cluster_metrics(members)[0])
@@ -1511,7 +1526,8 @@ if st.session_state.stage in ["normalization", "analysis"] and st.session_state.
 
     if not staff_review_records:
         st.success("No staff name pairs require review.")
-        st.session_state.staff_cluster_count = 0
+        st.session_state.staff_cluster_keys = []
+        st.session_state.staff_cluster_proposed_by_key = {}
     else:
         staff_clusters = {}
         for rec in staff_review_records:
@@ -1532,7 +1548,17 @@ if st.session_state.stage in ["normalization", "analysis"] and st.session_state.
         st.caption("One canonical per cluster — edits apply to both recipient and approver columns. "
                    "Edit the canonical text or untick variants to leave them as singletons.")
 
-        for i, (proposed, members) in enumerate(sorted_staff_clusters):
+        staff_cluster_keys = []
+        staff_cluster_proposed_by_key = {}
+        seen_keys = {}
+        for proposed, members in sorted_staff_clusters:
+            base = safe_widget_key(proposed)
+            n = seen_keys.get(base, 0)
+            ck = base if n == 0 else f"{base}_{n}"
+            seen_keys[base] = n + 1
+            staff_cluster_keys.append(ck)
+            staff_cluster_proposed_by_key[ck] = proposed
+
             total_value, total_count, dir_spread = staff_cluster_metrics(members)
             flags = sorted({f for m in members for f in m['Flags'].split(', ') if f})
             header = f"**{proposed}** — {len(members)} variant(s), {total_count} rows, £{total_value:,.0f}"
@@ -1542,7 +1568,7 @@ if st.session_state.stage in ["normalization", "analysis"] and st.session_state.
                 st.text_input(
                     "Canonical name",
                     value=proposed,
-                    key=f"staff_cluster_canon_{i}",
+                    key=f"staff_cluster_canon_{ck}",
                 )
                 member_df = pd.DataFrame([{
                     'Include': True,
@@ -1568,11 +1594,11 @@ if st.session_state.stage in ["normalization", "analysis"] and st.session_state.
                     },
                     hide_index=True,
                     use_container_width=True,
-                    key=f"staff_cluster_members_{i}",
+                    key=f"staff_cluster_members_{ck}",
                 )
-                st.session_state[f"staff_cluster_resolved_{i}"] = edited
-        st.session_state.staff_cluster_count = len(sorted_staff_clusters)
-        st.session_state.staff_cluster_proposed = [p for p, _ in sorted_staff_clusters]
+                st.session_state[f"staff_cluster_resolved_{ck}"] = edited
+        st.session_state.staff_cluster_keys = staff_cluster_keys
+        st.session_state.staff_cluster_proposed_by_key = staff_cluster_proposed_by_key
 
     # Directorate cluster review
     dir_auto_log_df = st.session_state.get('dir_auto_log', pd.DataFrame())
@@ -1588,7 +1614,8 @@ if st.session_state.stage in ["normalization", "analysis"] and st.session_state.
 
     if not dir_review_records:
         st.success("No directorate name pairs require review.")
-        st.session_state.dir_cluster_count = 0
+        st.session_state.dir_cluster_keys = []
+        st.session_state.dir_cluster_proposed_by_key = {}
     else:
         dir_clusters = {}
         for rec in dir_review_records:
@@ -1607,7 +1634,17 @@ if st.session_state.stage in ["normalization", "analysis"] and st.session_state.
 
         st.caption("Edit the canonical directorate name or untick variants to leave them as their own.")
 
-        for i, (proposed, members) in enumerate(sorted_dir_clusters):
+        dir_cluster_keys = []
+        dir_cluster_proposed_by_key = {}
+        seen_keys = {}
+        for proposed, members in sorted_dir_clusters:
+            base = safe_widget_key(proposed)
+            n = seen_keys.get(base, 0)
+            ck = base if n == 0 else f"{base}_{n}"
+            seen_keys[base] = n + 1
+            dir_cluster_keys.append(ck)
+            dir_cluster_proposed_by_key[ck] = proposed
+
             total_value, total_count = dir_cluster_metrics(members)
             flags = sorted({f for m in members for f in m['Flags'].split(', ') if f})
             header = f"**{proposed}** — {len(members)} variant(s), {total_count} rows, £{total_value:,.0f}"
@@ -1617,7 +1654,7 @@ if st.session_state.stage in ["normalization", "analysis"] and st.session_state.
                 st.text_input(
                     "Canonical directorate",
                     value=proposed,
-                    key=f"dir_cluster_canon_{i}",
+                    key=f"dir_cluster_canon_{ck}",
                 )
                 member_df = pd.DataFrame([{
                     'Include': True,
@@ -1641,21 +1678,21 @@ if st.session_state.stage in ["normalization", "analysis"] and st.session_state.
                     },
                     hide_index=True,
                     use_container_width=True,
-                    key=f"dir_cluster_members_{i}",
+                    key=f"dir_cluster_members_{ck}",
                 )
-                st.session_state[f"dir_cluster_resolved_{i}"] = edited
-        st.session_state.dir_cluster_count = len(sorted_dir_clusters)
-        st.session_state.dir_cluster_proposed = [p for p, _ in sorted_dir_clusters]
+                st.session_state[f"dir_cluster_resolved_{ck}"] = edited
+        st.session_state.dir_cluster_keys = dir_cluster_keys
+        st.session_state.dir_cluster_proposed_by_key = dir_cluster_proposed_by_key
 
     if st.button("Apply Normalisations & Run Pipeline", type="primary"):
         # Collect orphans before applying. An "orphan" is a cluster member the
         # user explicitly unticked — it floats with no proposed canonical.
         orphans = []
-        cluster_count = st.session_state.get('cluster_count', 0)
-        cluster_proposed = st.session_state.get('cluster_proposed', [])
-        for i in range(cluster_count):
-            proposed = cluster_proposed[i] if i < len(cluster_proposed) else ''
-            resolved = st.session_state.get(f"cluster_resolved_{i}")
+        cluster_keys = st.session_state.get('cluster_keys', [])
+        proposed_by_key = st.session_state.get('cluster_proposed_by_key', {})
+        for ck in cluster_keys:
+            proposed = proposed_by_key.get(ck, '')
+            resolved = st.session_state.get(f"cluster_resolved_{ck}")
             if resolved is None:
                 continue
             for _, row in resolved.iterrows():
@@ -1692,14 +1729,15 @@ if st.session_state.stage == "orphan_review" and st.session_state.get('orphans')
     canonical_metadata = {}
     for canon in set(auto_map.values()):
         canonical_metadata.setdefault(canon, (0, 0.0))
-    for i in range(st.session_state.get('cluster_count', 0)):
-        canon = st.session_state.get(f"cluster_canon_{i}", '').strip()
-        resolved = st.session_state.get(f"cluster_resolved_{i}")
+    proposed_by_key = st.session_state.get('cluster_proposed_by_key', {})
+    for ck in st.session_state.get('cluster_keys', []):
+        canon = st.session_state.get(f"cluster_canon_{ck}", '').strip()
+        resolved = st.session_state.get(f"cluster_resolved_{ck}")
         if not canon or resolved is None:
             continue
         if not resolved['Include'].any():
             continue
-        proposed = st.session_state.cluster_proposed[i]
+        proposed = proposed_by_key.get(ck, '')
         size, value = metrics_map.get(proposed, (0, 0.0))
         canonical_metadata[canon] = (size, value)
     for dst in persistent.get('organizations', {}).values():
