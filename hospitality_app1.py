@@ -146,7 +146,7 @@ def parse_value(value_str):
 
 
 ACCEPTED_STATUSES = {
-    'accepted', 'accept', 'approved', 'approve', 'yes', 'y',
+    'accepted', 'accept', 'acceptance', 'approved', 'approve', 'yes', 'y',
     'allowed', 'allow', 'granted', 'grant', 'received', 'receive',
     'taken', 'kept', 'agreed', 'agree', 'ok', 'okay',
 }
