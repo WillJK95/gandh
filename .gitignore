@@ -1,0 +1,3 @@
+__pycache__/
+*.py[cod]
+name_mappings.json
