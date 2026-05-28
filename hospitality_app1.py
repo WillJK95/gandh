@@ -1024,31 +1024,19 @@ def run_analysis_pipeline():
                 accepted[row['Raw']] = canonical
         return accepted
 
-    # Build final org_map: auto-applied + cluster acceptances + orphan overrides
+    # Build final maps: auto-applied + cluster acceptances + (for orgs) orphan overrides
     org_map = dict(st.session_state.get('org_auto_map', {}))
-    new_persistent_orgs = collect_cluster_overrides('cluster_keys', 'cluster')
-    org_map.update(new_persistent_orgs)
-
-    # Orphan overrides: only persist if mapped onto an existing canonical (not
-    # singleton, not freshly-coined). Existing canonicals = anything already in
-    # org_map.values() OR in the persistent organisations map.
-    existing_canonicals = set(org_map.values()) | set(persistent.get('organizations', {}).values())
+    org_map.update(collect_cluster_overrides('cluster_keys', 'cluster'))
     for raw, target in st.session_state.get('orphan_overrides', {}).items():
         if not target or target == raw:
             continue
         org_map[raw] = target
-        if target in existing_canonicals:
-            new_persistent_orgs[raw] = target
 
-    # Shared staff map: auto-applied + cluster acceptances
     staff_map = dict(st.session_state.get('staff_auto_map', {}))
-    new_persistent_staff = collect_cluster_overrides('staff_cluster_keys', 'staff_cluster')
-    staff_map.update(new_persistent_staff)
+    staff_map.update(collect_cluster_overrides('staff_cluster_keys', 'staff_cluster'))
 
-    # Directorate map: auto-applied + cluster acceptances
     dir_map = dict(st.session_state.get('dir_auto_map', {}))
-    new_persistent_dirs = collect_cluster_overrides('dir_cluster_keys', 'dir_cluster')
-    dir_map.update(new_persistent_dirs)
+    dir_map.update(collect_cluster_overrides('dir_cluster_keys', 'dir_cluster'))
 
     if 'recipient_name' in df_processed.columns:
         df_processed['recipient_name_clean'] = df_processed['recipient_name'].map(staff_map).fillna(
@@ -1074,20 +1062,35 @@ def run_analysis_pipeline():
     else:
         df_processed['directorate_clean'] = pd.NA
 
-    if new_persistent_orgs:
-        persistent['organizations'].update(new_persistent_orgs)
-        save_name_mappings(persistent)
-        st.session_state.name_mappings = persistent
+    # Persist every applied mapping (auto-merges + cluster acceptances + orphan
+    # overrides) so the next run hits the manual-map fast path instead of
+    # re-deriving the same decisions. Identity / empty mappings are skipped.
+    def clean_for_persist(m):
+        return {
+            str(k): str(v)
+            for k, v in m.items()
+            if isinstance(k, str) and isinstance(v, str)
+            and k.strip() and v.strip()
+            and k.strip() != v.strip()
+        }
 
-    new_staff = {k: v for k, v in new_persistent_staff.items() if str(k).strip() != str(v).strip() and v}
-    if new_staff:
-        persistent['staff'].update(new_staff)
-        save_name_mappings(persistent)
-        st.session_state.name_mappings = persistent
+    persisted_changed = False
+    new_orgs = clean_for_persist(org_map)
+    if new_orgs and new_orgs != persistent.get('organizations', {}):
+        persistent.setdefault('organizations', {}).update(new_orgs)
+        persisted_changed = True
 
-    new_dirs = {k: v for k, v in new_persistent_dirs.items() if str(k).strip() != str(v).strip() and v}
-    if new_dirs:
+    new_staff_full = clean_for_persist(staff_map)
+    if new_staff_full and new_staff_full != persistent.get('staff', {}):
+        persistent.setdefault('staff', {}).update(new_staff_full)
+        persisted_changed = True
+
+    new_dirs = clean_for_persist(dir_map)
+    if new_dirs and new_dirs != persistent.get('directorates', {}):
         persistent.setdefault('directorates', {}).update(new_dirs)
+        persisted_changed = True
+
+    if persisted_changed:
         save_name_mappings(persistent)
         st.session_state.name_mappings = persistent
 
