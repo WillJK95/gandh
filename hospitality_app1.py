@@ -145,6 +145,37 @@ def parse_value(value_str):
     return max(numbers) if numbers else np.nan
 
 
+ACCEPTED_STATUSES = {
+    'accepted', 'accept', 'approved', 'approve', 'yes', 'y',
+    'allowed', 'allow', 'granted', 'grant', 'received', 'receive',
+    'taken', 'kept', 'agreed', 'agree', 'ok', 'okay',
+}
+
+DECLINED_STATUSES = {
+    'declined', 'decline', 'rejected', 'reject', 'refused', 'refuse',
+    'no', 'n', 'returned', 'return', 'withdrawn', 'withdraw',
+    'denied', 'deny', 'not accepted', 'not approved', 'declined with thanks',
+}
+
+
+def normalise_status(s):
+    """Map common status phrasings ('Accepted', 'Approved', 'Yes', 'Declined',
+    'Rejected', etc.) onto canonical 'accepted' / 'declined'. Returns None for
+    anything that doesn't match — those rows surface in the Data Quality Log
+    instead of being silently misallocated."""
+    if not isinstance(s, str):
+        return None
+    cleaned = re.sub(r'[^a-z\s]', ' ', s.lower()).strip()
+    cleaned = re.sub(r'\s+', ' ', cleaned)
+    if not cleaned:
+        return None
+    if cleaned in ACCEPTED_STATUSES:
+        return 'accepted'
+    if cleaned in DECLINED_STATUSES:
+        return 'declined'
+    return None
+
+
 def categorize_hospitality(detail_str):
     detail_str = str(detail_str).lower()
     if any(w in detail_str for w in ['ticket', 'match', 'stadium', 'concert', 'theatre', 'show', 'opera', 'event', 'festival', 'sport']):
@@ -817,7 +848,7 @@ def calculate_single_group_compliance(group):
     app_offender_share = 0
 
     if 'approver_name' in group.columns and 'approver_name_clean' in group.columns:
-        accepted_group = group[group['status'].str.lower() == 'accepted']
+        accepted_group = group[group['status_clean'] == 'accepted']
         self_approved_flags = ['self approved', 'self-approved', 'on my own authority']
 
         recip_token = accepted_group['recipient_name'].apply(to_comparable_token)
@@ -862,7 +893,7 @@ def _entity_summary(df, group_col):
     splits and % calculation so both summaries stay in sync."""
     if group_col not in df.columns or df.empty:
         return pd.DataFrame()
-    status = df['status'].astype(str).str.lower()
+    status = df['status_clean'] if 'status_clean' in df.columns else pd.Series([None] * len(df), index=df.index)
     accepted_mask = status == 'accepted'
     declined_mask = status == 'declined'
     base = df.assign(_accepted=accepted_mask.astype(int), _declined=declined_mask.astype(int))
@@ -884,7 +915,7 @@ def build_recipient_summary(df):
     if out.empty:
         return out
     # Top offerer by £ value of accepted offers (falls back to all offers if none accepted).
-    accepted = df[df['status'].astype(str).str.lower() == 'accepted']
+    accepted = df[df.get('status_clean') == 'accepted'] if 'status_clean' in df.columns else df.iloc[0:0]
     if not accepted.empty and 'offered_by_org_clean' in accepted.columns:
         pair_value = accepted.groupby(['recipient_name_clean', 'offered_by_org_clean'])['value_parsed_gbp'].sum()
         top_offerer = pair_value.groupby(level=0).idxmax().apply(lambda x: x[1] if isinstance(x, tuple) else 'N/A')
@@ -915,12 +946,12 @@ def build_offerer_summary(df):
 
 def generate_compliance_metrics(df):
     report_dfs = {}
-    accepted_df = df[df['status'].str.lower() == 'accepted'].copy()
+    accepted_df = df[df['status_clean'] == 'accepted'].copy()
 
     accepted_dir = accepted_df.groupby(['directorate_clean'], dropna=False)['value_parsed_gbp'].agg(['sum', 'mean', 'median', 'max'])
     accepted_dir.columns = ['Accepted_' + col for col in accepted_dir.columns]
 
-    declined_dir = df[df['status'].str.lower() == 'declined'].groupby(['directorate_clean'], dropna=False)['value_parsed_gbp'].agg(['sum', 'mean', 'median', 'max'])
+    declined_dir = df[df['status_clean'] == 'declined'].groupby(['directorate_clean'], dropna=False)['value_parsed_gbp'].agg(['sum', 'mean', 'median', 'max'])
     declined_dir.columns = ['Declined_' + col for col in declined_dir.columns]
 
     val_dir = pd.concat([accepted_dir, declined_dir], axis=1, sort=True).fillna(0)
@@ -962,7 +993,7 @@ def generate_compliance_metrics(df):
     if 'grade' in df.columns:
         accepted_grade = accepted_df.groupby(['grade'])['value_parsed_gbp'].agg(['sum', 'mean', 'median', 'max'])
         accepted_grade.columns = ['Accepted_' + col for col in accepted_grade.columns]
-        declined_grade = df[df['status'].str.lower() == 'declined'].groupby(['grade'])['value_parsed_gbp'].agg(['sum', 'mean', 'median', 'max'])
+        declined_grade = df[df['status_clean'] == 'declined'].groupby(['grade'])['value_parsed_gbp'].agg(['sum', 'mean', 'median', 'max'])
         declined_grade.columns = ['Declined_' + col for col in declined_grade.columns]
         val_grade = pd.concat([accepted_grade, declined_grade], axis=1, sort=True).fillna(0)
         report_dfs['Value_by_Grade'] = val_grade.round(2)
@@ -987,18 +1018,21 @@ def generate_compliance_metrics(df):
     potential_groups = accepted_df[accepted_df.duplicated(subset=['date_received', 'offered_by_org_clean'], keep=False)].sort_values(by=['offered_by_org_clean', 'date_received'])
     report_dfs['Potential_Group_Events'] = potential_groups[[c for c in group_cols if c in potential_groups.columns]]
 
-    status_grouped = df.groupby(['recipient_name_clean', 'offered_by_org_clean', 'status']).size().unstack(fill_value=0)
+    status_grouped = df.groupby(['recipient_name_clean', 'offered_by_org_clean', 'status_clean'], dropna=False).size().unstack(fill_value=0)
     status_grouped['Total'] = status_grouped.sum(axis=1)
     report_dfs['High_Freq_Pairings'] = status_grouped.sort_values('Total', ascending=False).head(50)
 
-    issue_mask = df['timestamp'].isna() | df['value_parsed_gbp'].isna() | df['directorate_clean'].isna()
+    unknown_status_mask = df['status'].notna() & df['status_clean'].isna() if 'status_clean' in df.columns else pd.Series(False, index=df.index)
+    issue_mask = df['timestamp'].isna() | df['value_parsed_gbp'].isna() | df['directorate_clean'].isna() | unknown_status_mask
     if issue_mask.any():
         log_df = df[issue_mask].copy()
         log_df['Issue_Reason'] = ''
         log_df.loc[log_df['timestamp'].isna(), 'Issue_Reason'] += 'Invalid Timestamp; '
         log_df.loc[log_df['value_parsed_gbp'].isna(), 'Issue_Reason'] += 'Unparsable Value; '
         log_df.loc[log_df['directorate_clean'].isna(), 'Issue_Reason'] += 'Missing Directorate; '
-        log_cols = ['Issue_Reason', 'timestamp', 'recipient_name', 'value_raw', 'directorate', 'details', 'record_type']
+        if 'status_clean' in log_df.columns:
+            log_df.loc[log_df['status'].notna() & log_df['status_clean'].isna(), 'Issue_Reason'] += 'Unrecognised Status; '
+        log_cols = ['Issue_Reason', 'timestamp', 'recipient_name', 'value_raw', 'directorate', 'status', 'details', 'record_type']
         report_dfs['Data_Quality_Log'] = log_df[[c for c in log_cols if c in log_df.columns]]
 
     return report_dfs
@@ -1296,6 +1330,12 @@ if st.session_state.stage in ["mapping", "normalization", "analysis"] and st.ses
                 if col in mapped_df.columns:
                     mapped_df[col] = mapped_df[col].astype(str).str.strip()
                     mapped_df[col] = mapped_df[col].replace({'nan': pd.NA, '': pd.NA, 'None': pd.NA})
+
+            # Normalise status onto 'accepted' / 'declined' / NaN. The raw
+            # status is preserved; unrecognised values land as NaN and surface
+            # in the Data Quality Log.
+            if 'status' in mapped_df.columns:
+                mapped_df['status_clean'] = mapped_df['status'].apply(normalise_status)
 
             # Parse gift + hospitality values separately
             if 'gift_value' in mapped_df.columns:
@@ -1828,7 +1868,7 @@ if st.session_state.stage == "analysis" and "final_reports" in st.session_state:
     with c1:
         st.metric("Total Rows Evaluated", len(proc_df))
     with c2:
-        accepted_sum = proc_df[proc_df['status'].astype(str).str.lower() == 'accepted']['value_parsed_gbp'].sum()
+        accepted_sum = proc_df[proc_df['status_clean'] == 'accepted']['value_parsed_gbp'].sum()
         st.metric("Total Accepted Spend", f"£{accepted_sum:,.2f}")
     with c3:
         st.metric("Unparsable Value Failures", int(proc_df['value_parsed_gbp'].isna().sum()))
