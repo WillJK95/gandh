@@ -1108,25 +1108,20 @@ def run_analysis_pipeline():
             and k.strip() != v.strip()
         }
 
-    persisted_changed = False
-    new_orgs = clean_for_persist(org_map)
-    if new_orgs and new_orgs != persistent.get('organizations', {}):
-        persistent.setdefault('organizations', {}).update(new_orgs)
-        persisted_changed = True
+    def _merge_into(dest_key, new_entries):
+        existing = persistent.setdefault(dest_key, {})
+        additions = {k: v for k, v in new_entries.items() if existing.get(k) != v}
+        if additions:
+            existing.update(additions)
+            return True
+        return False
 
-    new_staff_full = clean_for_persist(staff_map)
-    if new_staff_full and new_staff_full != persistent.get('staff', {}):
-        persistent.setdefault('staff', {}).update(new_staff_full)
-        persisted_changed = True
+    _merge_into('organizations', clean_for_persist(org_map))
+    _merge_into('staff', clean_for_persist(staff_map))
+    _merge_into('directorates', clean_for_persist(dir_map))
 
-    new_dirs = clean_for_persist(dir_map)
-    if new_dirs and new_dirs != persistent.get('directorates', {}):
-        persistent.setdefault('directorates', {}).update(new_dirs)
-        persisted_changed = True
-
-    if persisted_changed:
-        save_name_mappings(persistent)
-        st.session_state.name_mappings = persistent
+    save_name_mappings(persistent)
+    st.session_state.name_mappings = persistent
 
     st.session_state.final_reports = generate_compliance_metrics(df_processed)
     st.session_state.df_processed = df_processed
