@@ -1040,6 +1040,21 @@ def generate_compliance_metrics(df):
     return report_dfs
 
 
+def collect_cluster_overrides(keys_state, prefix):
+    """Safely extracts approved cluster combinations while widgets are alive."""
+    accepted = {}
+    for ck in st.session_state.get(keys_state, []):
+        canonical = st.session_state.get(f"{prefix}_canon_{ck}", '').strip()
+        resolved = st.session_state.get(f"{prefix}_resolved_{ck}")
+        if resolved is None or not canonical:
+            continue
+        for _, row in resolved.iterrows():
+            if not row.get('Include', True):
+                continue
+            accepted[row['Raw']] = canonical
+    return accepted
+
+
 def run_analysis_pipeline():
     """Apply normalisations from session state, derive analytical columns, persist
     new mappings, and produce the report dataframes. Reachable both from the
@@ -1047,32 +1062,32 @@ def run_analysis_pipeline():
     df_processed = st.session_state.mapped_working_df.copy()
     persistent = st.session_state.name_mappings
 
-    def collect_cluster_overrides(keys_state, prefix):
-        accepted = {}
-        for ck in st.session_state.get(keys_state, []):
-            canonical = st.session_state.get(f"{prefix}_canon_{ck}", '').strip()
-            resolved = st.session_state.get(f"{prefix}_resolved_{ck}")
-            if resolved is None or not canonical:
-                continue
-            for _, row in resolved.iterrows():
-                if not row.get('Include', True):
-                    continue
-                accepted[row['Raw']] = canonical
-        return accepted
-
-    # Build final maps: auto-applied + cluster acceptances + (for orgs) orphan overrides
+    # Build final maps: auto-applied + cluster acceptances + (for orgs) orphan
+    # overrides. Cluster acceptances are read from the frozen cache captured on
+    # the Apply button click (the live widget keys may have been purged by a
+    # rerun, e.g. when detouring through orphan review); fall back to a live
+    # pull when no cache exists.
     org_map = dict(st.session_state.get('org_auto_map', {}))
-    org_map.update(collect_cluster_overrides('cluster_keys', 'cluster'))
+    if 'org_cluster_overrides' in st.session_state:
+        org_map.update(st.session_state.org_cluster_overrides)
+    else:
+        org_map.update(collect_cluster_overrides('cluster_keys', 'cluster'))
     for raw, target in st.session_state.get('orphan_overrides', {}).items():
         if not target or target == raw:
             continue
         org_map[raw] = target
 
     staff_map = dict(st.session_state.get('staff_auto_map', {}))
-    staff_map.update(collect_cluster_overrides('staff_cluster_keys', 'staff_cluster'))
+    if 'staff_cluster_overrides' in st.session_state:
+        staff_map.update(st.session_state.staff_cluster_overrides)
+    else:
+        staff_map.update(collect_cluster_overrides('staff_cluster_keys', 'staff_cluster'))
 
     dir_map = dict(st.session_state.get('dir_auto_map', {}))
-    dir_map.update(collect_cluster_overrides('dir_cluster_keys', 'dir_cluster'))
+    if 'dir_cluster_overrides' in st.session_state:
+        dir_map.update(st.session_state.dir_cluster_overrides)
+    else:
+        dir_map.update(collect_cluster_overrides('dir_cluster_keys', 'dir_cluster'))
 
     if 'recipient_name' in df_processed.columns:
         df_processed['recipient_name_clean'] = df_processed['recipient_name'].map(staff_map).fillna(
@@ -1124,6 +1139,11 @@ def run_analysis_pipeline():
 
     save_name_mappings(persistent)
     st.session_state.name_mappings = persistent
+
+    # Clear the frozen cluster cache so the next run starts from live widgets.
+    st.session_state.pop('org_cluster_overrides', None)
+    st.session_state.pop('staff_cluster_overrides', None)
+    st.session_state.pop('dir_cluster_overrides', None)
 
     st.session_state.final_reports = generate_compliance_metrics(df_processed)
     st.session_state.df_processed = df_processed
@@ -1736,6 +1756,14 @@ if st.session_state.stage in ["normalization", "analysis"] and st.session_state.
         st.session_state.dir_cluster_proposed_by_key = dir_cluster_proposed_by_key
 
     if st.button("Apply Normalisations & Run Pipeline", type="primary"):
+        # Freeze the cluster canonical choices into session state NOW, while the
+        # Step 3 widgets are still rendered. If we detour through orphan review,
+        # Streamlit purges the unrendered cluster widget keys, so the pipeline
+        # must read these frozen values rather than the (gone) live widgets.
+        st.session_state.org_cluster_overrides = collect_cluster_overrides('cluster_keys', 'cluster')
+        st.session_state.staff_cluster_overrides = collect_cluster_overrides('staff_cluster_keys', 'staff_cluster')
+        st.session_state.dir_cluster_overrides = collect_cluster_overrides('dir_cluster_keys', 'dir_cluster')
+
         # Collect orphans before applying. An "orphan" is a cluster member the
         # user explicitly unticked — it floats with no proposed canonical.
         orphans = []
@@ -1779,6 +1807,11 @@ if st.session_state.stage == "orphan_review" and st.session_state.get('orphans')
     # Build the surviving canonical pool with cluster-size + £ metadata.
     canonical_metadata = {}
     for canon in set(auto_map.values()):
+        canonical_metadata.setdefault(canon, (0, 0.0))
+    # Seed from the frozen cluster cache so the user's edited clusters appear as
+    # reassignment targets — the live cluster_canon_{ck} widgets are purged by
+    # the rerun that brought us to this screen.
+    for canon in set(st.session_state.get('org_cluster_overrides', {}).values()):
         canonical_metadata.setdefault(canon, (0, 0.0))
     proposed_by_key = st.session_state.get('cluster_proposed_by_key', {})
     for ck in st.session_state.get('cluster_keys', []):
