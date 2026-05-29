@@ -51,6 +51,7 @@ def load_name_mappings():
             data.setdefault('forced_clusters', {'organizations': [], 'staff': [], 'directorates': []})
             for k in ('organizations', 'staff', 'directorates'):
                 data['forced_clusters'].setdefault(k, [])
+            data.setdefault('column_mapping', {})
             return data
         except (json.JSONDecodeError, OSError):
             pass
@@ -61,6 +62,7 @@ def load_name_mappings():
         'staff': {},
         'directorates': {},
         'forced_clusters': {'organizations': [], 'staff': [], 'directorates': []},
+        'column_mapping': {},
     }
     save_name_mappings(data)
     return data
@@ -1267,6 +1269,7 @@ if st.session_state.stage in ["mapping", "normalization", "analysis"] and st.ses
 
     all_columns = list(st.session_state.raw_df.columns)
     options_with_none = ["None"] + all_columns
+    saved_col_map = st.session_state.name_mappings.get('column_mapping', {})
 
     def auto_detect(options, keywords, default_idx=0):
         for i, opt in enumerate(options):
@@ -1278,40 +1281,50 @@ if st.session_state.stage in ["mapping", "normalization", "analysis"] and st.ses
                 return i
         return default_idx if default_idx < len(options) else 0
 
+    def saved_idx(field, options, fallback_keywords, default_idx=0):
+        saved = saved_col_map.get(field)
+        if saved and saved in options:
+            return options.index(saved)
+        return auto_detect(options, fallback_keywords, default_idx)
+
     core_mapping = {}
     col1, col2, col3 = st.columns(3)
 
     with col1:
         st.markdown("**Common fields**")
-        core_mapping['timestamp'] = st.selectbox("Timestamp / Date Logged", all_columns, index=auto_detect(all_columns, ['timestamp']))
-        core_mapping['recipient_name'] = st.selectbox("Recipient Name", all_columns, index=auto_detect(all_columns, ['recipient']))
-        core_mapping['date_received'] = st.selectbox("Date Received / Event Date", all_columns, index=auto_detect(all_columns, ['received']))
-        core_mapping['offered_by_org'] = st.selectbox("Offered By Organisation", all_columns, index=auto_detect(all_columns, ['offered']))
-        core_mapping['directorate'] = st.selectbox("Directorate / Department", all_columns, index=auto_detect(all_columns, ['directorate']))
-        core_mapping['status'] = st.selectbox("Status (Accepted/Declined)", all_columns, index=auto_detect(all_columns, ['status']))
-        core_mapping['reason'] = st.selectbox("Reason for Acceptance", all_columns, index=auto_detect(all_columns, ['reason']))
+        core_mapping['timestamp'] = st.selectbox("Timestamp / Date Logged", all_columns, index=saved_idx('timestamp', all_columns, ['timestamp']))
+        core_mapping['recipient_name'] = st.selectbox("Recipient Name", all_columns, index=saved_idx('recipient_name', all_columns, ['recipient']))
+        core_mapping['date_received'] = st.selectbox("Date Received / Event Date", all_columns, index=saved_idx('date_received', all_columns, ['received']))
+        core_mapping['offered_by_org'] = st.selectbox("Offered By Organisation", all_columns, index=saved_idx('offered_by_org', all_columns, ['offered']))
+        core_mapping['directorate'] = st.selectbox("Directorate / Department", all_columns, index=saved_idx('directorate', all_columns, ['directorate']))
+        core_mapping['status'] = st.selectbox("Status (Accepted/Declined)", all_columns, index=saved_idx('status', all_columns, ['status']))
+        core_mapping['reason'] = st.selectbox("Reason for Acceptance", all_columns, index=saved_idx('reason', all_columns, ['reason']))
 
     with col2:
         st.markdown("**🎁 Gifts**")
-        core_mapping['gift_value'] = st.selectbox("Gift Value", options_with_none, index=auto_detect(options_with_none, ['gift', 'value']))
-        core_mapping['gift_description'] = st.selectbox("Gift Description", options_with_none, index=auto_detect(options_with_none, ['gift', 'desc']))
+        core_mapping['gift_value'] = st.selectbox("Gift Value", options_with_none, index=saved_idx('gift_value', options_with_none, ['gift', 'value']))
+        core_mapping['gift_description'] = st.selectbox("Gift Description", options_with_none, index=saved_idx('gift_description', options_with_none, ['gift', 'desc']))
 
     with col3:
         st.markdown("**🍽️ Hospitality**")
-        core_mapping['hospitality_value'] = st.selectbox("Hospitality Value", options_with_none, index=auto_detect(options_with_none, ['hospitality', 'value']))
-        core_mapping['hospitality_description'] = st.selectbox("Hospitality Description", options_with_none, index=auto_detect(options_with_none, ['hospitality', 'desc']))
+        core_mapping['hospitality_value'] = st.selectbox("Hospitality Value", options_with_none, index=saved_idx('hospitality_value', options_with_none, ['hospitality', 'value']))
+        core_mapping['hospitality_description'] = st.selectbox("Hospitality Description", options_with_none, index=saved_idx('hospitality_description', options_with_none, ['hospitality', 'desc']))
 
     st.markdown("**Optional layers**")
     oc1, oc2 = st.columns(2)
     with oc1:
-        core_mapping['grade'] = st.selectbox("Grade (Optional)", options_with_none, index=auto_detect(options_with_none, ['grade']))
+        core_mapping['grade'] = st.selectbox("Grade (Optional)", options_with_none, index=saved_idx('grade', options_with_none, ['grade']))
     with oc2:
-        core_mapping['approver_name'] = st.selectbox("Approver Name (Optional)", options_with_none, index=auto_detect(options_with_none, ['approver']))
+        core_mapping['approver_name'] = st.selectbox("Approver Name (Optional)", options_with_none, index=saved_idx('approver_name', options_with_none, ['approver']))
 
     if st.button("Lock Schema & Prepare Normalisations"):
         if core_mapping['gift_value'] == "None" and core_mapping['hospitality_value'] == "None":
             st.error("At least one of Gift Value or Hospitality Value must be mapped.")
         else:
+            persistent = st.session_state.name_mappings
+            persistent['column_mapping'] = dict(core_mapping)
+            save_name_mappings(persistent)
+
             mapped_df = st.session_state.raw_df.copy()
             inv_map = {v: k for k, v in core_mapping.items() if v != "None"}
             mapped_df = mapped_df.rename(columns=inv_map)
