@@ -51,6 +51,11 @@ def load_name_mappings():
             data.setdefault('forced_clusters', {'organizations': [], 'staff': [], 'directorates': []})
             for k in ('organizations', 'staff', 'directorates'):
                 data['forced_clusters'].setdefault(k, [])
+            # Rejected pairs: raw -> proposed-canonical suggestions the user has
+            # explicitly unticked, so the same incorrect merge isn't re-surfaced.
+            data.setdefault('rejected_pairs', {'organizations': [], 'staff': [], 'directorates': []})
+            for k in ('organizations', 'staff', 'directorates'):
+                data['rejected_pairs'].setdefault(k, [])
             data.setdefault('column_mapping', {})
             return data
         except (json.JSONDecodeError, OSError):
@@ -62,6 +67,7 @@ def load_name_mappings():
         'staff': {},
         'directorates': {},
         'forced_clusters': {'organizations': [], 'staff': [], 'directorates': []},
+        'rejected_pairs': {'organizations': [], 'staff': [], 'directorates': []},
         'column_mapping': {},
     }
     save_name_mappings(data)
@@ -101,6 +107,23 @@ def apply_forced_clusters(base_map, forced_pairs):
         if canon_b != winner:
             out[canon_b] = winner
     return out
+
+
+def build_rejected_lookup(rejected_pairs, normaliser):
+    """Turn stored [raw, proposed_canonical] rejection pairs into a fast lookup
+    set of (raw, normalised_canonical) tuples. The canonical side is normalised
+    (via the caller's normaliser) so a re-derived suggestion still matches even
+    if its surface text differs slightly between runs; the raw side is matched
+    exactly because the same source file yields the same raw strings."""
+    rejected = set()
+    for pair in rejected_pairs or []:
+        if not isinstance(pair, (list, tuple)) or len(pair) < 2:
+            continue
+        raw, canon = str(pair[0]).strip(), str(pair[1]).strip()
+        if not raw or not canon:
+            continue
+        rejected.add((raw, normaliser(canon)))
+    return rejected
 
 
 def save_name_mappings(data):
@@ -390,8 +413,13 @@ def _classify_tier(score, len_ratio, cand_info, matched_canon, cluster_size):
     return ('review', flags)
 
 
-def compute_org_normalisations(raw_orgs, persistent_org_map):
+def compute_org_normalisations(raw_orgs, persistent_org_map, rejected_pairs=None):
     """Tiered org normalisation.
+
+    Args:
+        rejected_pairs: list of [raw, proposed_canonical] the user previously
+            unticked. Matching review suggestions are suppressed so the same
+            incorrect merge isn't re-surfaced on a later run.
 
     Returns:
         auto_map: dict raw -> canonical (silent merges + manual map hits)
@@ -401,6 +429,8 @@ def compute_org_normalisations(raw_orgs, persistent_org_map):
     raw_orgs = [o for o in raw_orgs if isinstance(o, str) and o.strip()]
     unique_raw = sorted(set(raw_orgs))
 
+    rejected = build_rejected_lookup(rejected_pairs, light_normalise)
+
     auto_map = {}
     auto_log = []
     review_records = []
@@ -408,6 +438,8 @@ def compute_org_normalisations(raw_orgs, persistent_org_map):
 
     def add_review(raw, canon, score, len_ratio, flags, parenthetical):
         if raw in review_seen:
+            return
+        if (raw, light_normalise(canon)) in rejected:
             return
         review_seen.add(raw)
         review_records.append({
@@ -632,10 +664,14 @@ def staff_normalised_key(name):
     return light_normalise_person(name)
 
 
-def compute_staff_normalisations(raw_names, persistent_staff_map):
+def compute_staff_normalisations(raw_names, persistent_staff_map, rejected_pairs=None):
     """Tiered staff-name normalisation. Same shape as compute_org_normalisations
     but tuned for person names: no 'courtesy of' semantics, parenthetical role
     text stripped, emails converted to 'First Last'.
+
+    Args:
+        rejected_pairs: list of [raw, proposed_canonical] the user previously
+            unticked; matching review suggestions are suppressed.
 
     Returns:
         auto_map: dict raw -> canonical
@@ -645,6 +681,8 @@ def compute_staff_normalisations(raw_names, persistent_staff_map):
     raw_names = [n for n in raw_names if isinstance(n, str) and n.strip()]
     unique_raw = sorted(set(raw_names))
 
+    rejected = build_rejected_lookup(rejected_pairs, staff_normalised_key)
+
     auto_map = {}
     auto_log = []
     review_records = []
@@ -652,6 +690,8 @@ def compute_staff_normalisations(raw_names, persistent_staff_map):
 
     def add_review(raw, canon, score, len_ratio, flags, parenthetical):
         if raw in review_seen:
+            return
+        if (raw, staff_normalised_key(canon)) in rejected:
             return
         review_seen.add(raw)
         review_records.append({
@@ -1043,16 +1083,44 @@ def generate_compliance_metrics(df):
 def collect_cluster_overrides(keys_state, prefix):
     """Safely extracts approved cluster combinations while widgets are alive."""
     accepted = {}
+    proposed_by_key = st.session_state.get(f"{prefix}_proposed_by_key", {})
     for ck in st.session_state.get(keys_state, []):
         canonical = st.session_state.get(f"{prefix}_canon_{ck}", '').strip()
         resolved = st.session_state.get(f"{prefix}_resolved_{ck}")
         if resolved is None or not canonical:
             continue
+        # The cluster header (proposed canonical) is not itself a member row. If
+        # the user renamed it — e.g. to fix a misspelled primary while keeping
+        # the tick — map the original proposed name onto the new canonical too,
+        # otherwise the raw equal to the old canonical is never remapped and the
+        # rename silently fails to fold the primary in.
+        proposed = proposed_by_key.get(ck, '')
+        if proposed and proposed != canonical and 'Include' in resolved and resolved['Include'].any():
+            accepted[proposed] = canonical
         for _, row in resolved.iterrows():
             if not row.get('Include', True):
                 continue
             accepted[row['Raw']] = canonical
     return accepted
+
+
+def collect_cluster_rejections(keys_state, proposed_by_key_state, prefix):
+    """Capture unticked cluster members as rejected (raw, proposed-canonical)
+    pairs. These are persisted so the same incorrect suggestion isn't surfaced
+    for review again the next time the file is loaded. The rejection is recorded
+    against the original *proposed* canonical (what the matcher would re-suggest),
+    not any edited canonical text."""
+    rejections = []
+    proposed_by_key = st.session_state.get(proposed_by_key_state, {})
+    for ck in st.session_state.get(keys_state, []):
+        resolved = st.session_state.get(f"{prefix}_resolved_{ck}")
+        proposed = proposed_by_key.get(ck, '')
+        if resolved is None or not proposed:
+            continue
+        for _, row in resolved.iterrows():
+            if not row.get('Include', True):
+                rejections.append([str(row['Raw']), str(proposed)])
+    return rejections
 
 
 def run_analysis_pipeline():
@@ -1137,6 +1205,32 @@ def run_analysis_pipeline():
     _merge_into('staff', clean_for_persist(staff_map))
     _merge_into('directorates', clean_for_persist(dir_map))
 
+    # Persist the user's unticks ("these are NOT the same") alongside their
+    # ticks, so re-loading the same file doesn't re-surface rejected suggestions.
+    # A rejection is dropped if a positive mapping now sends that raw to the same
+    # canonical (the positive decision supersedes the earlier rejection).
+    def _merge_rejections(category, new_pairs, positive_map):
+        bucket = persistent.setdefault('rejected_pairs', {}).setdefault(category, [])
+        pairs = {
+            (str(p[0]).strip(), str(p[1]).strip())
+            for p in bucket
+            if isinstance(p, (list, tuple)) and len(p) >= 2
+        }
+        for p in new_pairs:
+            if not isinstance(p, (list, tuple)) or len(p) < 2:
+                continue
+            raw, canon = str(p[0]).strip(), str(p[1]).strip()
+            if raw and canon:
+                pairs.add((raw, canon))
+        kept = sorted(
+            [raw, canon] for raw, canon in pairs if positive_map.get(raw) != canon
+        )
+        persistent['rejected_pairs'][category] = kept
+
+    _merge_rejections('organizations', st.session_state.get('org_cluster_rejections', []), org_map)
+    _merge_rejections('staff', st.session_state.get('staff_cluster_rejections', []), staff_map)
+    _merge_rejections('directorates', st.session_state.get('dir_cluster_rejections', []), dir_map)
+
     save_name_mappings(persistent)
     st.session_state.name_mappings = persistent
 
@@ -1144,6 +1238,9 @@ def run_analysis_pipeline():
     st.session_state.pop('org_cluster_overrides', None)
     st.session_state.pop('staff_cluster_overrides', None)
     st.session_state.pop('dir_cluster_overrides', None)
+    st.session_state.pop('org_cluster_rejections', None)
+    st.session_state.pop('staff_cluster_rejections', None)
+    st.session_state.pop('dir_cluster_rejections', None)
 
     st.session_state.final_reports = generate_compliance_metrics(df_processed)
     st.session_state.df_processed = df_processed
@@ -1174,8 +1271,8 @@ def render_mapping_editor():
     persistent = st.session_state.name_mappings
     with st.sidebar.expander("📚 Manage name mappings", expanded=False):
         st.caption(f"Stored at `{MAPPING_FILE.name}`. Edits are written on Save.")
-        tab_o, tab_s, tab_d, tab_l, tab_f = st.tabs([
-            "Organizations", "Staff", "Directorates", "Legacy", "Forced clusters"
+        tab_o, tab_s, tab_d, tab_l, tab_f, tab_r = st.tabs([
+            "Organizations", "Staff", "Directorates", "Legacy", "Forced clusters", "Rejected pairs"
         ])
 
         for label, key, tab in [("Organizations", "organizations", tab_o),
@@ -1242,6 +1339,35 @@ def render_mapping_editor():
                     persistent.setdefault('forced_clusters', {})[scope_key] = new_pairs
                     if save_name_mappings(persistent):
                         st.success(f"Saved {len(new_pairs)} {scope_label.lower()} forced pair(s).")
+
+        with tab_r:
+            st.caption("Suggested pairings you previously unticked — recorded as "
+                       "'NOT the same' so the matcher won't re-surface them. Delete a "
+                       "row and save to let a pairing be suggested again.")
+            for scope_label, scope_key in [("Organizations", "organizations"),
+                                            ("Staff", "staff"),
+                                            ("Directorates", "directorates")]:
+                st.markdown(f"**{scope_label}**")
+                pairs = persistent.get('rejected_pairs', {}).get(scope_key, [])
+                pair_df = pd.DataFrame(
+                    [{'Raw': a, 'Rejected canonical': b} for a, b in pairs]
+                    or [{'Raw': '', 'Rejected canonical': ''}]
+                )
+                edited_pairs = st.data_editor(
+                    pair_df,
+                    num_rows='dynamic',
+                    use_container_width=True,
+                    key=f'sidebar_rejected_{scope_key}',
+                )
+                if st.button(f"Save {scope_label} rejected pairs", key=f'sidebar_save_rejected_{scope_key}'):
+                    new_pairs = [
+                        [str(row['Raw']).strip(), str(row['Rejected canonical']).strip()]
+                        for _, row in edited_pairs.iterrows()
+                        if str(row.get('Raw', '')).strip() and str(row.get('Rejected canonical', '')).strip()
+                    ]
+                    persistent.setdefault('rejected_pairs', {})[scope_key] = new_pairs
+                    if save_name_mappings(persistent):
+                        st.success(f"Saved {len(new_pairs)} {scope_label.lower()} rejected pair(s).")
 
 
 render_mapping_editor()
@@ -1412,8 +1538,10 @@ if st.session_state.stage in ["mapping", "normalization", "analysis"] and st.ses
             persistent = st.session_state.name_mappings
             forced = persistent.get('forced_clusters', {}) or {}
             raw_orgs = mapped_df['offered_by_org'].dropna().unique().tolist() if 'offered_by_org' in mapped_df.columns else []
+            rejected = persistent.get('rejected_pairs', {}) or {}
             org_persistent = apply_forced_clusters(persistent.get('organizations', {}), forced.get('organizations', []))
-            auto_map, auto_log, review_records = compute_org_normalisations(raw_orgs, org_persistent)
+            auto_map, auto_log, review_records = compute_org_normalisations(
+                raw_orgs, org_persistent, rejected.get('organizations', []))
 
             # Annotate review records with value + directorate metrics for risk-weighted sorting
             value_lookup = mapped_df.groupby('offered_by_org')['value_parsed_gbp'].sum().to_dict() if 'offered_by_org' in mapped_df.columns else {}
@@ -1433,7 +1561,7 @@ if st.session_state.stage in ["mapping", "normalization", "analysis"] and st.ses
             raw_staff = sorted(recip_uniques | approver_uniques)
             staff_persistent = apply_forced_clusters(get_staff_map(persistent), forced.get('staff', []))
             staff_auto_map, staff_auto_log, staff_review_records = compute_staff_normalisations(
-                raw_staff, staff_persistent
+                raw_staff, staff_persistent, rejected.get('staff', [])
             )
 
             # Risk-weighted metadata: sum value/count/dir-spread across BOTH roles
@@ -1463,7 +1591,7 @@ if st.session_state.stage in ["mapping", "normalization", "analysis"] and st.ses
             raw_dirs = mapped_df['directorate'].dropna().unique().tolist() if 'directorate' in mapped_df.columns else []
             dir_persistent = apply_forced_clusters(persistent.get('directorates', {}), forced.get('directorates', []))
             dir_auto_map, dir_auto_log, dir_review_records = compute_org_normalisations(
-                raw_dirs, dir_persistent
+                raw_dirs, dir_persistent, rejected.get('directorates', [])
             )
             dir_value_lookup = mapped_df.groupby('directorate')['value_parsed_gbp'].sum().to_dict() if 'directorate' in mapped_df.columns else {}
             dir_count_lookup = mapped_df['directorate'].value_counts().to_dict() if 'directorate' in mapped_df.columns else {}
@@ -1763,6 +1891,15 @@ if st.session_state.stage in ["normalization", "analysis"] and st.session_state.
         st.session_state.org_cluster_overrides = collect_cluster_overrides('cluster_keys', 'cluster')
         st.session_state.staff_cluster_overrides = collect_cluster_overrides('staff_cluster_keys', 'staff_cluster')
         st.session_state.dir_cluster_overrides = collect_cluster_overrides('dir_cluster_keys', 'dir_cluster')
+
+        # Freeze the unticks (rejected suggestions) the same way, so they survive
+        # the rerun whether or not we detour through orphan review.
+        st.session_state.org_cluster_rejections = collect_cluster_rejections(
+            'cluster_keys', 'cluster_proposed_by_key', 'cluster')
+        st.session_state.staff_cluster_rejections = collect_cluster_rejections(
+            'staff_cluster_keys', 'staff_cluster_proposed_by_key', 'staff_cluster')
+        st.session_state.dir_cluster_rejections = collect_cluster_rejections(
+            'dir_cluster_keys', 'dir_cluster_proposed_by_key', 'dir_cluster')
 
         # Collect orphans before applying. An "orphan" is a cluster member the
         # user explicitly unticked — it floats with no proposed canonical.
