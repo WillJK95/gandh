@@ -1083,11 +1083,20 @@ def generate_compliance_metrics(df):
 def collect_cluster_overrides(keys_state, prefix):
     """Safely extracts approved cluster combinations while widgets are alive."""
     accepted = {}
+    proposed_by_key = st.session_state.get(f"{prefix}_proposed_by_key", {})
     for ck in st.session_state.get(keys_state, []):
         canonical = st.session_state.get(f"{prefix}_canon_{ck}", '').strip()
         resolved = st.session_state.get(f"{prefix}_resolved_{ck}")
         if resolved is None or not canonical:
             continue
+        # The cluster header (proposed canonical) is not itself a member row. If
+        # the user renamed it — e.g. to fix a misspelled primary while keeping
+        # the tick — map the original proposed name onto the new canonical too,
+        # otherwise the raw equal to the old canonical is never remapped and the
+        # rename silently fails to fold the primary in.
+        proposed = proposed_by_key.get(ck, '')
+        if proposed and proposed != canonical and 'Include' in resolved and resolved['Include'].any():
+            accepted[proposed] = canonical
         for _, row in resolved.iterrows():
             if not row.get('Include', True):
                 continue
