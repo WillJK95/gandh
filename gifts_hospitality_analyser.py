@@ -174,6 +174,7 @@ ACCEPTED_STATUSES = {
     'accepted', 'accept', 'acceptance', 'approved', 'approve', 'yes', 'y',
     'allowed', 'allow', 'granted', 'grant', 'received', 'receive',
     'taken', 'kept', 'agreed', 'agree', 'ok', 'okay',
+    'acceptance pending',
 }
 
 DECLINED_STATUSES = {
@@ -952,6 +953,47 @@ def _entity_summary(df, group_col):
     return out
 
 
+def _count_recycled_rationales(df):
+    """For each recipient, count accepted entries whose rationale appears in a fuzzy-similar
+    cluster of 3 or more entries. Returns a Series indexed by recipient_name_clean."""
+    if fuzz is None or 'reason' not in df.columns or 'recipient_name_clean' not in df.columns:
+        return pd.Series(dtype=int)
+
+    accepted = df[df['status_clean'] == 'accepted'] if 'status_clean' in df.columns else df
+    reasons_df = accepted[accepted['reason'].notna() & (accepted['reason'].astype(str).str.strip() != '')]
+
+    if reasons_df.empty:
+        return pd.Series(dtype=int)
+
+    def _norm(s):
+        s = re.sub(r'[^a-z0-9\s]', ' ', str(s).lower())
+        return re.sub(r'\s+', ' ', s).strip()
+
+    result = {}
+    for recipient, group in reasons_df.groupby('recipient_name_clean', dropna=False):
+        reasons = [_norm(r) for r in group['reason'].tolist()]
+        n = len(reasons)
+        if n < 3:
+            result[recipient] = 0
+            continue
+        visited = [False] * n
+        recycled = 0
+        for i in range(n):
+            if visited[i]:
+                continue
+            cluster = [i]
+            for j in range(i + 1, n):
+                if not visited[j] and fuzz.token_set_ratio(reasons[i], reasons[j]) >= 75:
+                    cluster.append(j)
+                    visited[j] = True
+            visited[i] = True
+            if len(cluster) >= 3:
+                recycled += len(cluster)
+        result[recipient] = recycled
+
+    return pd.Series(result, name='recycled_rationales')
+
+
 def build_recipient_summary(df):
     out = _entity_summary(df, 'recipient_name_clean')
     if out.empty:
@@ -966,8 +1008,15 @@ def build_recipient_summary(df):
         out['top_offerer_by_value'] = out['top_offerer_by_value'].fillna('N/A')
     else:
         out['top_offerer_by_value'] = 'N/A'
+    recycled = _count_recycled_rationales(df)
+    if not recycled.empty:
+        out = out.join(recycled)
+        out['recycled_rationales'] = out['recycled_rationales'].fillna(0).astype(int)
+    else:
+        out['recycled_rationales'] = 0
     out = out.reset_index().rename(columns={'recipient_name_clean': 'recipient'})
-    cols = ['recipient', 'num_offers', 'num_accepted', '%_accepted', '£_accepted', '£_declined', 'top_offerer_by_value']
+    cols = ['recipient', 'num_offers', 'num_accepted', '%_accepted', '£_accepted', '£_declined',
+            'top_offerer_by_value', 'recycled_rationales']
     return out[[c for c in cols if c in out.columns]].sort_values('£_accepted', ascending=False)
 
 
