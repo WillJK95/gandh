@@ -3,3 +3,4 @@ pandas
 numpy
 thefuzz
 python-Levenshtein
+openpyxl
