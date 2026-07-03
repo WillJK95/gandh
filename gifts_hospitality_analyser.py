@@ -58,8 +58,16 @@ def load_name_mappings():
                 data['rejected_pairs'].setdefault(k, [])
             data.setdefault('column_mapping', {})
             return data
-        except (json.JSONDecodeError, OSError):
-            pass
+        except (json.JSONDecodeError, OSError) as e:
+            # Keep the unreadable file rather than overwriting it with defaults
+            # below — it may hold months of accumulated mapping decisions.
+            backup = MAPPING_FILE.with_suffix('.json.bak')
+            try:
+                MAPPING_FILE.replace(backup)
+                st.warning(f"Could not read {MAPPING_FILE.name} ({e}). The unreadable file was "
+                           f"kept as {backup.name}; starting with default mappings.")
+            except OSError:
+                st.warning(f"Could not read {MAPPING_FILE.name} ({e}); starting with default mappings.")
     data = {
         'organizations': dict(SEED_ORG_MAP),
         'recipients': {},
@@ -84,6 +92,20 @@ def get_staff_map(persistent):
     return merged
 
 
+def collapse_map_chains(mapping):
+    """Resolve raw -> X -> Y chains in-place so every key maps directly to its
+    terminal canonical. Consumers apply these maps single-hop (Series.map), so
+    any chain would silently split a merged cluster."""
+    for key in list(mapping):
+        seen = {key}
+        target = mapping[key]
+        while target in mapping and mapping[target] != target and target not in seen:
+            seen.add(target)
+            target = mapping[target]
+        mapping[key] = target
+    return mapping
+
+
 def apply_forced_clusters(base_map, forced_pairs):
     """Augment a raw -> canonical map with forced cluster pairs. For each pair
     (A, B) the cleaner of A and B wins as the canonical; both raws then point
@@ -106,7 +128,9 @@ def apply_forced_clusters(base_map, forced_pairs):
             out[canon_a] = winner
         if canon_b != winner:
             out[canon_b] = winner
-    return out
+    # Entries that pointed at a losing canonical before it was remapped would
+    # otherwise be left one hop behind (X -> A -> winner).
+    return collapse_map_chains(out)
 
 
 def build_rejected_lookup(rejected_pairs, normaliser):
@@ -162,7 +186,9 @@ def parse_value(value_str):
 
     if not numbers:
         return np.nan
-    if any(term in value_str for term in ['-', 'to']) and len(numbers) > 1:
+    # Range detection is digit-anchored ('£100 - £200', '20 to 30') so that a
+    # hyphen or 'to' inside a word ('pre-paid', 'total') doesn't trigger it.
+    if re.search(r'\d\s*(?:-|to)\s*(?:£|gbp)?\s*\d', value_str) and len(numbers) > 1:
         return np.mean(numbers)
     if ('£' in value_str and value_str.count('£') > 1) or (' and ' in value_str) or ('+' in value_str) or ('accomm' in value_str):
         return sum(numbers)
@@ -526,24 +552,10 @@ def compute_org_normalisations(raw_orgs, persistent_org_map, rejected_pairs=None
         for nrm, canon in canonical_pool.items():
             pool_by_block.setdefault(first_token_block_key(canon), []).append(nrm)
 
-        # Union-find of merges
-        parent = {nrm: nrm for nrm in canonical_pool}
-
-        def find(x):
-            while parent[x] != x:
-                parent[x] = parent[parent[x]]
-                x = parent[x]
-            return x
-
-        def union(a, b):
-            ra, rb = find(a), find(b)
-            if ra == rb:
-                return
-            # The 'cleaner' canonical wins as the cluster root (no parens > no extra punct > longer)
-            if canonical_preference_key(canonical_pool[ra]) <= canonical_preference_key(canonical_pool[rb]):
-                parent[rb] = ra
-            else:
-                parent[ra] = rb
+        # Records canon_b -> canon_a for every pool merge, so chains left by
+        # later merges (raw -> B while B itself merged into A) can be collapsed
+        # before returning.
+        canon_remap = {}
 
         # Compare canonicals within each block
         for block, nrms in pool_by_block.items():
@@ -567,7 +579,7 @@ def compute_org_normalisations(raw_orgs, persistent_org_map, rejected_pairs=None
                     is_substring = (a in b or b in a)
 
                     if not b_has_human and score >= 92 and 0.7 <= len_ratio <= 1.3:
-                        union(a, b)
+                        canon_remap[canon_b] = canon_a
                         for raw in b_members:
                             if candidates[raw]['has_human_intervention'] or raw in auto_map:
                                 continue
@@ -579,7 +591,7 @@ def compute_org_normalisations(raw_orgs, persistent_org_map, rejected_pairs=None
                             auto_log.append({'Raw': canon_b, 'Canonical': canon_a, 'Score': score, 'Reason': 'pool-merge balanced'})
                         continue
                     if not b_has_human and score >= 88 and is_substring and len_ratio >= 0.7:
-                        union(a, b)
+                        canon_remap[canon_b] = canon_a
                         for raw in b_members:
                             if candidates[raw]['has_human_intervention'] or raw in auto_map:
                                 continue
@@ -607,6 +619,13 @@ def compute_org_normalisations(raw_orgs, persistent_org_map, rejected_pairs=None
                         # Also surface canon_b itself if it appears as a raw
                         if canon_b in unique_raw and canon_b not in review_seen and canon_b not in auto_map:
                             add_review(canon_b, canon_a, score, len_ratio, info, '')
+
+        if canon_remap:
+            collapse_map_chains(canon_remap)
+            for raw, canon in list(auto_map.items()):
+                auto_map[raw] = canon_remap.get(canon, canon)
+            for entry in auto_log:
+                entry['Canonical'] = auto_map.get(entry['Raw'], entry['Canonical'])
 
     return auto_map, auto_log, review_records
 
@@ -769,22 +788,7 @@ def compute_staff_normalisations(raw_names, persistent_staff_map, rejected_pairs
             block = '__joint__' if '|' in nrm else first_token_block_key(canon)
             pool_by_block.setdefault(block, []).append(nrm)
 
-        parent = {nrm: nrm for nrm in canonical_pool}
-
-        def find(x):
-            while parent[x] != x:
-                parent[x] = parent[parent[x]]
-                x = parent[x]
-            return x
-
-        def union(a, b):
-            ra, rb = find(a), find(b)
-            if ra == rb:
-                return
-            if canonical_preference_key(canonical_pool[ra]) <= canonical_preference_key(canonical_pool[rb]):
-                parent[rb] = ra
-            else:
-                parent[ra] = rb
+        canon_remap = {}
 
         for block, nrms in pool_by_block.items():
             if len(nrms) < 2:
@@ -809,7 +813,7 @@ def compute_staff_normalisations(raw_names, persistent_staff_map, rejected_pairs
                     single_token = a_single or b_single
 
                     if not single_token and score >= 92 and 0.7 <= len_ratio <= 1.3:
-                        union(a, b)
+                        canon_remap[canon_b] = canon_a
                         for raw in b_members:
                             if raw in auto_map:
                                 continue
@@ -820,7 +824,7 @@ def compute_staff_normalisations(raw_names, persistent_staff_map, rejected_pairs
                             auto_log.append({'Raw': canon_b, 'Canonical': canon_a, 'Score': score, 'Reason': 'pool-merge balanced'})
                         continue
                     if not single_token and score >= 88 and is_substring and len_ratio >= 0.7:
-                        union(a, b)
+                        canon_remap[canon_b] = canon_a
                         for raw in b_members:
                             if raw in auto_map:
                                 continue
@@ -854,6 +858,13 @@ def compute_staff_normalisations(raw_names, persistent_staff_map, rejected_pairs
                             add_review(raw, canon_a, score, len_ratio, info, candidates[raw]['parenthetical'])
                         if canon_b in unique_raw and canon_b not in review_seen and canon_b not in auto_map:
                             add_review(canon_b, canon_a, score, len_ratio, info, '')
+
+        if canon_remap:
+            collapse_map_chains(canon_remap)
+            for raw, canon in list(auto_map.items()):
+                auto_map[raw] = canon_remap.get(canon, canon)
+            for entry in auto_log:
+                entry['Canonical'] = auto_map.get(entry['Raw'], entry['Canonical'])
 
     # Singleton-only review: pull in any solo single-token entries that didn't
     # match anything else, so the user can still review/merge them by hand.
@@ -1106,7 +1117,10 @@ def generate_compliance_metrics(df):
     report_dfs['Individual_Compliance_Data'] = rankings
 
     group_cols = ['timestamp', 'date_received', 'recipient_name_clean', 'directorate_clean', 'offered_by_org_clean', 'details', 'value_parsed_gbp']
-    potential_groups = accepted_df[accepted_df.duplicated(subset=['date_received', 'offered_by_org_clean'], keep=False)].sort_values(by=['offered_by_org_clean', 'date_received'])
+    # duplicated() treats NaN as equal to NaN, so undated rows must be excluded
+    # or every undated offer from one org gets flagged as a "group event".
+    dated_accepted = accepted_df[accepted_df['date_received'].notna()]
+    potential_groups = dated_accepted[dated_accepted.duplicated(subset=['date_received', 'offered_by_org_clean'], keep=False)].sort_values(by=['offered_by_org_clean', 'date_received'])
     report_dfs['Potential_Group_Events'] = potential_groups[[c for c in group_cols if c in potential_groups.columns]]
 
     status_grouped = df.groupby(['recipient_name_clean', 'offered_by_org_clean', 'status_clean'], dropna=False).size().unstack(fill_value=0)
@@ -1225,8 +1239,11 @@ def run_analysis_pipeline():
 
     df_processed['hospitality_category'] = df_processed['details'].apply(categorize_hospitality)
     if 'directorate' in df_processed.columns:
+        # The raw column was already stripped (and blanks set to NA) at the
+        # mapping stage; astype(str) here would turn NA into the string '<NA>'
+        # and defeat both the fillna and the Missing Directorate quality check.
         df_processed['directorate_clean'] = df_processed['directorate'].map(dir_map).fillna(
-            df_processed['directorate'].astype(str).str.strip())
+            df_processed['directorate'])
     else:
         df_processed['directorate_clean'] = pd.NA
 
@@ -1290,6 +1307,10 @@ def run_analysis_pipeline():
     st.session_state.pop('org_cluster_rejections', None)
     st.session_state.pop('staff_cluster_rejections', None)
     st.session_state.pop('dir_cluster_rejections', None)
+    # Orphan decisions are persisted above; clearing them stops a later
+    # pipeline run from silently re-applying stale reassignments.
+    st.session_state.pop('orphan_overrides', None)
+    st.session_state.pop('orphans', None)
 
     st.session_state.final_reports = generate_compliance_metrics(df_processed)
     st.session_state.df_processed = df_processed
@@ -1424,6 +1445,19 @@ render_mapping_editor()
 # --- STEP 1: FILE UPLOADER ---
 uploaded_files = st.file_uploader("Upload Hospitality CSV Registers", type=["csv"], accept_multiple_files=True)
 
+if st.session_state.raw_df is not None:
+    if st.button("🔄 Start over (clear loaded data)"):
+        # Drop everything derived from the loaded files; keep name_mappings.
+        static_keys = {'raw_df', 'mapped_working_df', 'df_processed', 'final_reports',
+                       'cluster_keys', 'cluster_proposed_by_key', 'cluster_metrics_map', 'orphans'}
+        for k in list(st.session_state.keys()):
+            if k in static_keys or k.startswith(('org_', 'staff_', 'dir_', 'cluster_', 'orphan_')):
+                del st.session_state[k]
+        st.session_state.stage = "upload"
+        st.session_state.raw_df = None
+        st.session_state.mapped_working_df = None
+        st.rerun()
+
 if uploaded_files:
     if st.button("Load and Combine Files", type="primary") or st.session_state.raw_df is not None:
         if st.session_state.raw_df is None:
@@ -1513,8 +1547,16 @@ if st.session_state.stage in ["mapping", "normalization", "analysis"] and st.ses
         core_mapping['approver_name'] = st.selectbox("Approver Name (Optional)", options_with_none, index=saved_idx('approver_name', options_with_none, ['approver']))
 
     if st.button("Lock Schema & Prepare Normalisations"):
+        col_to_fields = {}
+        for field, col in core_mapping.items():
+            if col != "None":
+                col_to_fields.setdefault(col, []).append(field)
+        clashes = {col: fields for col, fields in col_to_fields.items() if len(fields) > 1}
         if core_mapping['gift_value'] == "None" and core_mapping['hospitality_value'] == "None":
             st.error("At least one of Gift Value or Hospitality Value must be mapped.")
+        elif clashes:
+            st.error("Each source column can only be mapped to one field. Clashing selections: " +
+                     '; '.join(f"`{col}` → {', '.join(fields)}" for col, fields in clashes.items()))
         else:
             persistent = st.session_state.name_mappings
             persistent['column_mapping'] = dict(core_mapping)
@@ -1694,7 +1736,7 @@ if st.session_state.stage in ["normalization", "analysis"] and st.session_state.
 
         sorted_clusters = sorted(
             clusters.items(),
-            key=lambda kv: (cluster_metrics(kv[1])[0], cluster_metrics(kv[1])[1]),
+            key=lambda kv: cluster_metrics(kv[1])[:2],
             reverse=True,
         )
 
@@ -1789,7 +1831,7 @@ if st.session_state.stage in ["normalization", "analysis"] and st.session_state.
 
         sorted_staff_clusters = sorted(
             staff_clusters.items(),
-            key=lambda kv: (staff_cluster_metrics(kv[1])[0], staff_cluster_metrics(kv[1])[1]),
+            key=lambda kv: staff_cluster_metrics(kv[1])[:2],
             reverse=True,
         )
 
@@ -1876,7 +1918,7 @@ if st.session_state.stage in ["normalization", "analysis"] and st.session_state.
 
         sorted_dir_clusters = sorted(
             dir_clusters.items(),
-            key=lambda kv: (dir_cluster_metrics(kv[1])[0], dir_cluster_metrics(kv[1])[1]),
+            key=lambda kv: dir_cluster_metrics(kv[1]),
             reverse=True,
         )
 
